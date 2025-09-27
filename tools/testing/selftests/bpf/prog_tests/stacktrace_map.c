@@ -2,7 +2,7 @@
 #include <test_progs.h>
 #include "stacktrace_map.skel.h"
 
-void test_stacktrace_map(void)
+static void test_stacktrace_map_tp(void)
 {
 	struct stacktrace_map *skel;
 	int control_map_fd, stackid_hmap_fd, stackmap_fd, stack_amap_fd;
@@ -59,4 +59,37 @@ void test_stacktrace_map(void)
 		goto out;
 out:
 	stacktrace_map__destroy(skel);
+}
+
+static void test_stacktrace_map_double_entry(void)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	struct stacktrace_map *skel;
+	int prog_fd, err;
+
+	skel = stacktrace_map__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
+		return;
+
+	skel->links.test = bpf_program__attach_trace(skel->progs.test);
+	if (!ASSERT_OK_PTR(skel->links.test, "bpf_program__attach_trace"))
+		goto cleanup;
+
+	prog_fd = bpf_program__fd(skel->progs.trigger);
+	err = bpf_prog_test_run_opts(prog_fd, &topts);
+	ASSERT_OK(err, "test_run");
+	ASSERT_EQ(topts.retval, 0, "test_run");
+
+	ASSERT_EQ(skel->bss->test_result, true, "result");
+
+cleanup:
+	stacktrace_map__destroy(skel);
+}
+
+void test_stacktrace_map(void)
+{
+	if (test__start_subtest("tp"))
+		test_stacktrace_map_tp();
+	if (test__start_subtest("double_entry"))
+		test_stacktrace_map_double_entry();
 }
