@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
 #include "stacktrace_map.skel.h"
+#include "stacktrace_map_double_entry.skel.h"
 
 static void test_stacktrace_map_tp(void)
 {
@@ -64,14 +65,14 @@ out:
 static void test_stacktrace_map_double_entry(void)
 {
 	LIBBPF_OPTS(bpf_test_run_opts, topts);
-	struct stacktrace_map *skel;
+	struct stacktrace_map_double_entry *skel;
 	int prog_fd, err;
 
-	skel = stacktrace_map__open_and_load();
+	skel = stacktrace_map_double_entry__open_and_load();
 	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
 		return;
 
-	skel->links.test = bpf_program__attach_trace(skel->progs.test);
+	skel->links.test = bpf_program__attach_trace(skel->progs.test_fentry);
 	if (!ASSERT_OK_PTR(skel->links.test, "bpf_program__attach_trace"))
 		goto cleanup;
 
@@ -80,10 +81,10 @@ static void test_stacktrace_map_double_entry(void)
 	ASSERT_OK(err, "test_run");
 	ASSERT_EQ(topts.retval, 0, "test_run");
 
-	ASSERT_EQ(skel->bss->test_result, true, "result");
+	ASSERT_EQ(skel->bss->test_result_fentry, true, "result");
 
 cleanup:
-	stacktrace_map__destroy(skel);
+	stacktrace_map_double_entry__destroy(skel);
 }
 
 void test_stacktrace_map(void)

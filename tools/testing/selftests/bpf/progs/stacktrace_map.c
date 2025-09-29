@@ -3,7 +3,6 @@
 
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
 
 #ifndef PERF_MAX_STACK_DEPTH
 #define PERF_MAX_STACK_DEPTH         127
@@ -73,37 +72,6 @@ int oncpu(struct sched_switch_args *ctx)
 			bpf_get_stack(ctx, stack_p, max_len, 0);
 	}
 
-	return 0;
-}
-
-/*
- * No tests in here, just to trigger 'bpf_fentry_test*'
- * through tracing test_run.
- */
-SEC("fentry/bpf_modify_return_test")
-int BPF_PROG(trigger)
-{
-	return 0;
-}
-
-bool test_result;
-
-SEC("fentry/bpf_fentry_test1")
-int BPF_PROG(test)
-{
-	__u32 max_len = PERF_MAX_STACK_DEPTH * sizeof(__u64);
-	unsigned long *entry;
-	__u32 key = 0;
-	long err;
-
-	entry = bpf_map_lookup_elem(&stack_amap, &key);
-
-	if (entry) {
-		err = bpf_get_stack(ctx, entry, max_len, 0);
-		if (err <= 0)
-			return 0;
-		test_result = entry[0] != entry[1];
-	}
 	return 0;
 }
 
