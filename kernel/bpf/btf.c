@@ -6838,6 +6838,12 @@ bool btf_ctx_access(int off, int size, enum bpf_access_type type,
 	u32 nr_args, arg;
 	int i, ret;
 
+	if (is_tracing_multi(prog->expected_attach_type)) {
+		bpf_log(log, "multi attach type (%d) does not support direct context access\n",
+			prog->expected_attach_type);
+		return false;
+	}
+
 	if (off % 8) {
 		bpf_log(log, "func '%s' offset %d is not multiple of 8\n",
 			tname, off);
