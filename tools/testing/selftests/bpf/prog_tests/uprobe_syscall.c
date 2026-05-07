@@ -475,6 +475,14 @@ static void test_uprobe_legacy(void)
 
 	check(skel, link, uprobe_test, uprobe_test, 2);
 
+	/* reattach */
+	link = bpf_program__attach_uprobe_opts(skel->progs.test_uprobe,
+				0, "/proc/self/exe", offset, NULL);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_uprobe_opts"))
+		goto cleanup;
+
+	check(skel, link, uprobe_test, uprobe_test, 4);
+
 	/* uretprobe */
 	skel->bss->executed = 0;
 
@@ -516,6 +524,14 @@ static void test_uprobe_multi(void)
 		goto cleanup;
 
 	check(skel, link, uprobe_test, uprobe_test, 2);
+
+	/* reattach */
+	link = bpf_program__attach_uprobe_multi(skel->progs.test_uprobe_multi,
+				0, "/proc/self/exe", NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_uprobe_multi"))
+		goto cleanup;
+
+	check(skel, link, uprobe_test, uprobe_test, 4);
 
 	/* uretprobe.multi */
 	skel->bss->executed = 0;
@@ -560,6 +576,14 @@ static void test_uprobe_session(void)
 
 	check(skel, link, uprobe_test, uprobe_test, 4);
 
+	/* reattach */
+	link = bpf_program__attach_uprobe_multi(skel->progs.test_uprobe_session,
+				0, "/proc/self/exe", NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_uprobe_multi"))
+		goto cleanup;
+
+	check(skel, link, uprobe_test, uprobe_test, 8);
+
 cleanup:
 	uprobe_syscall_executed__destroy(skel);
 }
@@ -588,6 +612,15 @@ static void test_uprobe_usdt(void)
 		goto cleanup;
 
 	check(skel, link, usdt_test, addr, 2);
+
+	/* reattach */
+	link = bpf_program__attach_usdt(skel->progs.test_usdt,
+				-1 /* all PIDs */, "/proc/self/exe",
+				"optimized_uprobe", "usdt", NULL);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_usdt"))
+		goto cleanup;
+
+	check(skel, link, usdt_test, addr, 4);
 
 cleanup:
 	uprobe_syscall_executed__destroy(skel);
