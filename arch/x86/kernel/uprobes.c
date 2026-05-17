@@ -682,19 +682,21 @@ static unsigned long find_nearest_trampoline(unsigned long vaddr)
 	return high_tramp;
 }
 
-static struct uprobe_trampoline *create_uprobe_trampoline(unsigned long vaddr)
+static struct uprobe_trampoline *
+create_uprobe_trampoline(struct mm_struct *mm, unsigned long vaddr, bool nearest)
 {
 	struct pt_regs *regs = task_pt_regs(current);
-	struct mm_struct *mm = current->mm;
 	struct uprobe_trampoline *tramp;
 	struct vm_area_struct *vma;
 
 	if (!user_64bit_mode(regs))
 		return NULL;
 
-	vaddr = find_nearest_trampoline(vaddr);
-	if (IS_ERR_VALUE(vaddr))
-		return NULL;
+	if (nearest)  {
+		vaddr = find_nearest_trampoline(vaddr);
+		if (IS_ERR_VALUE(vaddr))
+			return NULL;
+	}
 
 	tramp = kzalloc_obj(*tramp);
 	if (unlikely(!tramp))
@@ -726,7 +728,7 @@ static struct uprobe_trampoline *get_uprobe_trampoline(unsigned long vaddr, bool
 		}
 	}
 
-	tramp = create_uprobe_trampoline(vaddr);
+	tramp = create_uprobe_trampoline(current->mm, vaddr, true);
 	if (!tramp)
 		return NULL;
 
@@ -1822,6 +1824,22 @@ bool is_uprobe_at_func_entry(struct pt_regs *regs)
 		return true;
 
 	return false;
+}
+
+int arch_uprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
+{
+	struct uprobes_state *old_state = &oldmm->uprobes_state;
+	struct uprobes_state *new_state = &newmm->uprobes_state;
+	struct uprobe_trampoline *old_tramp, *new_tramp;
+
+	hlist_for_each_entry(old_tramp, &old_state->head_tramps, node) {
+		new_tramp = create_uprobe_trampoline(newmm, old_tramp->vaddr, false);
+		if (!new_tramp)
+			return -EINVAL;
+		hlist_add_head(&new_tramp->node, &new_state->head_tramps);
+	}
+
+	return 0;
 }
 
 #ifdef CONFIG_IA32_EMULATION
