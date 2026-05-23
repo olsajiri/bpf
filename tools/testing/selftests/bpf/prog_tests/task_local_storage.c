@@ -16,6 +16,7 @@
 #include "task_local_storage_exit_creds.skel.h"
 #include "task_ls_recursion.skel.h"
 #include "task_storage_nodeadlock.skel.h"
+#include "task_storage_probe_alloc.skel.h"
 #include "uptr_test_common.h"
 #include "task_ls_uptr.skel.h"
 #include "uptr_update_failure.skel.h"
@@ -240,6 +241,61 @@ static void test_nodeadlock(void)
 done:
 	task_storage_nodeadlock__destroy(skel);
 	sched_setaffinity(getpid(), sizeof(old), &old);
+}
+
+static noinline void task_storage_probe_alloc_trigger(void)
+{
+	asm volatile("");
+}
+
+static void test_probe_large_alloc(void)
+{
+	LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts);
+	LIBBPF_OPTS(bpf_uprobe_multi_opts, uprobe_multi_opts);
+	struct task_storage_probe_alloc *skel;
+	unsigned long offsets[1];
+	struct bpf_link *link;
+	ssize_t uprobe_offset;
+
+	uprobe_offset = get_uprobe_offset(&task_storage_probe_alloc_trigger);
+	if (!ASSERT_GE(uprobe_offset, 0, "get_uprobe_offset"))
+		return;
+	offsets[0] = uprobe_offset;
+
+	skel = task_storage_probe_alloc__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "open_and_load"))
+		return;
+
+	skel->bss->target_pid = getpid();
+
+	link = bpf_program__attach_uprobe_opts(skel->progs.single_uprobe,
+					       0, "/proc/self/exe",
+					       uprobe_offset, &uprobe_opts);
+	if (!ASSERT_OK_PTR(link, "attach_single_uprobe"))
+		goto out;
+	skel->links.single_uprobe = link;
+
+	uprobe_multi_opts.offsets = offsets;
+	uprobe_multi_opts.cnt = 1;
+
+	link = bpf_program__attach_uprobe_multi(skel->progs.uprobe_multi,
+						0, "/proc/self/exe", NULL,
+						&uprobe_multi_opts);
+	if (!ASSERT_OK_PTR(link, "attach_uprobe_multi"))
+		goto out;
+	skel->links.uprobe_multi = link;
+
+	task_storage_probe_alloc_trigger();
+
+	ASSERT_EQ(skel->bss->single_uprobe_runs, 1, "single_uprobe_runs");
+	ASSERT_EQ(skel->bss->single_uprobe_nulls, 0, "single_uprobe_nulls");
+	ASSERT_EQ(skel->bss->single_uprobe_bad, 0, "single_uprobe_bad");
+	ASSERT_EQ(skel->bss->uprobe_multi_runs, 1, "uprobe_multi_runs");
+	ASSERT_EQ(skel->bss->uprobe_multi_nulls, 0, "uprobe_multi_nulls");
+	ASSERT_EQ(skel->bss->uprobe_multi_bad, 0, "uprobe_multi_bad");
+
+out:
+	task_storage_probe_alloc__destroy(skel);
 }
 
 static struct user_data udata __attribute__((aligned(16))) = {
@@ -505,6 +561,8 @@ void test_task_local_storage(void)
 		test_recursion();
 	if (test__start_subtest("nodeadlock"))
 		test_nodeadlock();
+	if (test__start_subtest("probe_large_alloc"))
+		test_probe_large_alloc();
 	if (test__start_subtest("uptr_basic"))
 		test_uptr_basic();
 	if (test__start_subtest("uptr_across_pages"))
