@@ -118,7 +118,7 @@ static long bpf_pid_task_storage_update_elem(struct bpf_map *map, void *key,
 
 	sdata = bpf_local_storage_update(
 		task, (struct bpf_local_storage_map *)map, value, map_flags,
-		true);
+		true /* swap_uptrs */, false /* sleepable */);
 
 	err = PTR_ERR_OR_ZERO(sdata);
 out:
@@ -165,9 +165,12 @@ out:
 	return err;
 }
 
-BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
-	   task, void *, value, u64, flags)
+static unsigned long __bpf_task_storage_get(struct bpf_map *map,
+					    struct task_struct *task,
+					    void *value, u64 flags,
+					    bool sleepable)
 {
+	struct bpf_local_storage_map *smap = (struct bpf_local_storage_map *)map;
 	struct bpf_local_storage_data *sdata;
 
 	WARN_ON_ONCE(!bpf_rcu_lock_held());
@@ -181,13 +184,46 @@ BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
 	/* only allocate new storage, when the task is refcounted */
 	if (refcount_read(&task->usage) &&
 	    (flags & BPF_LOCAL_STORAGE_GET_F_CREATE)) {
-		sdata = bpf_local_storage_update(
-			task, (struct bpf_local_storage_map *)map, value,
-			BPF_NOEXIST, false);
+		sdata = bpf_local_storage_update(task, smap, value, BPF_NOEXIST,
+						 false /* swap_uptrs */,
+						 sleepable /* sleepable */);
 		return IS_ERR(sdata) ? (unsigned long)NULL : (unsigned long)sdata->data;
 	}
 
 	return (unsigned long)NULL;
+}
+
+BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
+	   task, void *, value, u64, flags)
+{
+	return __bpf_task_storage_get(map, task, value, flags, false);
+}
+
+BPF_CALL_4(bpf_task_storage_get_sleepable_uprobe_multi, struct bpf_map *, map,
+	   struct task_struct *, task, void *, value, u64, flags)
+{
+	return __bpf_task_storage_get(map, task, value, flags, true);
+}
+
+static bool bpf_task_storage_get_sleepable_kprobe_alloc(void)
+{
+#ifdef CONFIG_UPROBES
+	struct bpf_trace_run_ctx *run_ctx;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_trace_run_ctx, run_ctx);
+	if (run_ctx->is_uprobe)
+		return true;
+#endif
+	return false;
+}
+
+BPF_CALL_4(bpf_task_storage_get_sleepable_kprobe, struct bpf_map *, map,
+	   struct task_struct *, task, void *, value, u64, flags)
+{
+	bool sleepable;
+
+	sleepable = bpf_task_storage_get_sleepable_kprobe_alloc();
+	return __bpf_task_storage_get(map, task, value, flags, sleepable);
 }
 
 BPF_CALL_2(bpf_task_storage_delete, struct bpf_map *, map, struct task_struct *,
@@ -238,6 +274,30 @@ const struct bpf_map_ops task_storage_map_ops = {
 const struct bpf_func_proto bpf_task_storage_get_proto = {
 	.func = bpf_task_storage_get,
 	.gpl_only = false,
+	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
+	.arg1_type = ARG_CONST_MAP_PTR,
+	.arg2_type = ARG_PTR_TO_BTF_ID_OR_NULL,
+	.arg2_btf_id = &btf_tracing_ids[BTF_TRACING_TYPE_TASK],
+	.arg3_type = ARG_PTR_TO_MAP_VALUE_OR_NULL,
+	.arg4_type = ARG_ANYTHING,
+};
+
+const struct bpf_func_proto bpf_task_storage_get_sleepable_uprobe_multi_proto = {
+	.func = bpf_task_storage_get_sleepable_uprobe_multi,
+	.gpl_only = false,
+	.might_sleep = true,
+	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
+	.arg1_type = ARG_CONST_MAP_PTR,
+	.arg2_type = ARG_PTR_TO_BTF_ID_OR_NULL,
+	.arg2_btf_id = &btf_tracing_ids[BTF_TRACING_TYPE_TASK],
+	.arg3_type = ARG_PTR_TO_MAP_VALUE_OR_NULL,
+	.arg4_type = ARG_ANYTHING,
+};
+
+const struct bpf_func_proto bpf_task_storage_get_sleepable_kprobe_proto = {
+	.func = bpf_task_storage_get_sleepable_kprobe,
+	.gpl_only = false,
+	.might_sleep = true,
 	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
 	.arg1_type = ARG_CONST_MAP_PTR,
 	.arg2_type = ARG_PTR_TO_BTF_ID_OR_NULL,

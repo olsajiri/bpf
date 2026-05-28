@@ -200,7 +200,8 @@ bpf_local_storage_alloc(void *owner,
 
 struct bpf_local_storage_data *
 bpf_local_storage_update(void *owner, struct bpf_local_storage_map *smap,
-			 void *value, u64 map_flags, bool swap_uptrs);
+			 void *value, u64 map_flags, bool swap_uptrs,
+			 bool sleepable);
 
 u64 bpf_local_storage_map_mem_usage(const struct bpf_map *map);
 
