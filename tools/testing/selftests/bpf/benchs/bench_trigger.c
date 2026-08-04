@@ -13,22 +13,34 @@
 
 static struct {
 	__u32 batch_iters;
+	__u32 user_rb_size;
+	__u64 user_rb_timer_ns;
 } args = {
 	.batch_iters = 100,
+	.user_rb_size = 4096,
+	.user_rb_timer_ns = 1000000,
 };
 
 enum {
 	ARG_TRIG_BATCH_ITERS = 7000,
+	ARG_TRIG_USER_RB_TIMER_NS,
+	ARG_TRIG_USER_RB_SIZE,
 };
 
 static const struct argp_option opts[] = {
 	{ "trig-batch-iters", ARG_TRIG_BATCH_ITERS, "BATCH_ITER_CNT", 0,
 		"Number of in-kernel iterations per one driver test run"},
+	{ "user-rb-timer-ns", ARG_TRIG_USER_RB_TIMER_NS, "NSEC", 0,
+		"User ring buffer drain timer interval in nanoseconds"},
+	{ "user-rb-size", ARG_TRIG_USER_RB_SIZE, "BYTES", 0,
+		"User ring buffer size in bytes"},
 	{},
 };
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
+	unsigned long long value;
+	char *end;
 	long ret;
 
 	switch (key) {
@@ -40,6 +52,25 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			argp_usage(state);
 		}
 		args.batch_iters = ret;
+		break;
+	case ARG_TRIG_USER_RB_TIMER_NS:
+		errno = 0;
+		value = strtoull(arg, &end, 10);
+		if (errno || end == arg || *end || arg[0] == '-' || !value) {
+			fprintf(stderr, "invalid --user-rb-timer-ns value (should be positive)\n");
+			argp_usage(state);
+		}
+		args.user_rb_timer_ns = value;
+		break;
+	case ARG_TRIG_USER_RB_SIZE:
+		errno = 0;
+		value = strtoull(arg, &end, 10);
+		if (errno || end == arg || *end || value > UINT_MAX ||
+		    !value || (value & (value - 1)) || value % getpagesize()) {
+			fprintf(stderr, "--user-rb-size must be page-aligned power of two\n");
+			argp_usage(state);
+		}
+		args.user_rb_size = value;
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -61,11 +92,13 @@ const struct argp bench_trigger_batch_argp = {
 /* BPF triggering benchmarks */
 static struct trigger_ctx {
 	struct trigger_bench *skel;
+	struct user_ring_buffer *user_ringbuf;
 	bool usermode_counters;
 	int driver_prog_fd;
 } ctx;
 
 static struct counter base_hits[MAX_BUCKETS];
+static struct counter user_ringbuf_enospc;
 
 static __always_inline void inc_counter(struct counter *counters)
 {
@@ -100,6 +133,15 @@ static void trigger_validate(void)
 	}
 }
 
+static void trigger_user_ringbuf_validate(void)
+{
+	trigger_validate();
+	if (env.producer_cnt != 1) {
+		fprintf(stderr, "benchmark requires exactly one producer!\n");
+		exit(1);
+	}
+}
+
 static void *trigger_producer(void *input)
 {
 	if (ctx.usermode_counters) {
@@ -124,12 +166,120 @@ static void *trigger_producer_batch(void *input)
 	return NULL;
 }
 
+static __always_inline __u64 *user_ringbuf_reserve(void)
+{
+	__u64 *sample;
+
+	while (true) {
+		sample = user_ring_buffer__reserve(ctx.user_ringbuf, sizeof(*sample));
+		if (sample)
+			return sample;
+		if (errno == ENOSPC) {
+			atomic_inc(&user_ringbuf_enospc.value);
+			continue;
+		}
+
+		fprintf(stderr, "failed to reserve user ringbuf sample: %s\n",
+			strerror(errno));
+		exit(1);
+	}
+}
+
+static void *trigger_user_ringbuf_timer_producer(void *input)
+{
+	__u64 *sample;
+
+	while (true) {
+		sample = user_ringbuf_reserve();
+		*sample = 0;
+		user_ring_buffer__submit(ctx.user_ringbuf, sample);
+	}
+
+	return NULL;
+}
+
+static void *trigger_user_ringbuf_syscall_producer(void *input)
+{
+	__u64 *sample;
+
+	while (true) {
+		sample = user_ringbuf_reserve();
+		*sample = 0;
+		user_ring_buffer__submit(ctx.user_ringbuf, sample);
+		(void)syscall(__NR_getppid);
+	}
+
+	return NULL;
+}
+
 static void trigger_measure(struct bench_res *res)
 {
 	if (ctx.usermode_counters)
 		res->hits = sum_and_reset_counters(base_hits);
 	else
 		res->hits = sum_and_reset_counters(ctx.skel->bss->hits);
+}
+
+static void trigger_user_ringbuf_measure(struct bench_res *res)
+{
+	trigger_measure(res);
+	res->drops = atomic_swap(&user_ringbuf_enospc.value, 0);
+}
+
+static void trigger_user_ringbuf_timer_measure(struct bench_res *res)
+{
+	trigger_user_ringbuf_measure(res);
+	res->important_hits = atomic_swap(&ctx.skel->bss->user_ringbuf_timer_fires.value, 0);
+}
+
+static void trigger_user_ringbuf_timer_report_progress(int iter, struct bench_res *res,
+						       long delta_ns)
+{
+	double delta_sec = delta_ns / 1000000000.0;
+
+	printf("Iter %3d (%7.3lfus): ", iter,
+	       (delta_ns - 1000000000) / 1000.0);
+	printf("hits %8.3lfM/s, drops %8.3lfM/s, timer-fires %8.3lfM/s\n",
+	       res->hits / 1000000.0 / delta_sec,
+	       res->drops / 1000000.0 / delta_sec,
+	       res->important_hits / 1000000.0 / delta_sec);
+}
+
+static void trigger_user_ringbuf_timer_report_final(struct bench_res res[], int res_cnt)
+{
+	struct basic_stats hits = {}, enospc = {}, timer_fires = {};
+	double value;
+	int i;
+
+	for (i = 0; i < res_cnt; i++) {
+		hits.mean += res[i].hits / 1000000.0 / res_cnt;
+		enospc.mean += res[i].drops / 1000000.0 / res_cnt;
+		timer_fires.mean += res[i].important_hits / 1000000.0 / res_cnt;
+	}
+
+	if (res_cnt > 1) {
+		for (i = 0; i < res_cnt; i++) {
+			value = res[i].hits / 1000000.0;
+			hits.stddev += (hits.mean - value) * (hits.mean - value) /
+				       (res_cnt - 1.0);
+			value = res[i].drops / 1000000.0;
+			enospc.stddev += (enospc.mean - value) * (enospc.mean - value) /
+					 (res_cnt - 1.0);
+			value = res[i].important_hits / 1000000.0;
+			timer_fires.stddev +=
+				(timer_fires.mean - value) * (timer_fires.mean - value) /
+				(res_cnt - 1.0);
+		}
+
+		hits.stddev = sqrt(hits.stddev);
+		enospc.stddev = sqrt(enospc.stddev);
+		timer_fires.stddev = sqrt(timer_fires.stddev);
+	}
+
+	printf("Summary: hits %8.3lf ± %5.3lfM/s, ", hits.mean, hits.stddev);
+	printf("drops %8.3lf ± %5.3lfM/s, ", enospc.mean, enospc.stddev);
+	printf("timer-fires %8.3lf ± %5.3lfM/s\n",
+	       timer_fires.mean, timer_fires.stddev);
 }
 
 static void setup_ctx(void)
@@ -147,6 +297,21 @@ static void setup_ctx(void)
 
 	ctx.skel->rodata->batch_iters = args.batch_iters;
 	ctx.skel->rodata->stacktrace = env.stacktrace;
+	ctx.skel->rodata->user_ringbuf_timer_ns = args.user_rb_timer_ns;
+	ctx.skel->rodata->user_ringbuf_target_tgid = getpid();
+}
+
+static void set_user_ringbuf_size(void)
+{
+	int err;
+
+	err = bpf_map__set_max_entries(ctx.skel->maps.user_ringbuf,
+				       args.user_rb_size);
+	if (err) {
+		fprintf(stderr, "failed to set user ringbuf size: %s\n",
+			strerror(-err));
+		exit(1);
+	}
 }
 
 static void load_ctx(void)
@@ -174,6 +339,51 @@ static void attach_bpf(struct bpf_program *prog)
 static void trigger_syscall_count_setup(void)
 {
 	ctx.usermode_counters = true;
+}
+
+static void setup_user_ringbuf(void)
+{
+	int map_fd;
+
+	map_fd = bpf_map__fd(ctx.skel->maps.user_ringbuf);
+	ctx.user_ringbuf = user_ring_buffer__new(map_fd, NULL);
+	if (!ctx.user_ringbuf) {
+		fprintf(stderr, "failed to create user ringbuf: %s\n", strerror(errno));
+		exit(1);
+	}
+}
+
+static void trigger_user_ringbuf_timer_setup(void)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+	int err;
+
+	setup_ctx();
+	bpf_program__set_autoload(ctx.skel->progs.trigger_driver, false);
+	bpf_program__set_autoload(ctx.skel->progs.trigger_user_ringbuf_timer_init, true);
+	set_user_ringbuf_size();
+	load_ctx();
+	setup_user_ringbuf();
+
+	err = bpf_prog_test_run_opts(
+		bpf_program__fd(ctx.skel->progs.trigger_user_ringbuf_timer_init),
+		&opts);
+	if (err || opts.retval) {
+		fprintf(stderr, "failed to start user ringbuf timer: %s (retval %d)\n",
+			err ? strerror(errno) : "BPF program error", (__s32)opts.retval);
+		exit(1);
+	}
+}
+
+static void trigger_user_ringbuf_syscall_setup(void)
+{
+	setup_ctx();
+	bpf_program__set_autoload(ctx.skel->progs.trigger_driver, false);
+	bpf_program__set_autoload(ctx.skel->progs.trigger_user_ringbuf_syscall, true);
+	set_user_ringbuf_size();
+	load_ctx();
+	setup_user_ringbuf();
+	attach_bpf(ctx.skel->progs.trigger_user_ringbuf_syscall);
 }
 
 /* Batched, staying mostly in-kernel triggering setups */
@@ -610,6 +820,27 @@ const struct bench bench_trig_syscall_count = {
 	.setup = trigger_syscall_count_setup,
 	.producer_thread = trigger_producer,
 	.measure = trigger_measure,
+	.report_progress = hits_drops_report_progress,
+	.report_final = hits_drops_report_final,
+};
+
+const struct bench bench_trig_user_ringbuf_timer = {
+	.name = "trig-user-ringbuf-timer",
+	.validate = trigger_user_ringbuf_validate,
+	.setup = trigger_user_ringbuf_timer_setup,
+	.producer_thread = trigger_user_ringbuf_timer_producer,
+	.measure = trigger_user_ringbuf_timer_measure,
+	.report_progress = trigger_user_ringbuf_timer_report_progress,
+	.report_final = trigger_user_ringbuf_timer_report_final,
+	.argp = &bench_trigger_batch_argp,
+};
+
+const struct bench bench_trig_user_ringbuf_syscall = {
+	.name = "trig-user-ringbuf-syscall",
+	.validate = trigger_user_ringbuf_validate,
+	.setup = trigger_user_ringbuf_syscall_setup,
+	.producer_thread = trigger_user_ringbuf_syscall_producer,
+	.measure = trigger_user_ringbuf_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
 };
