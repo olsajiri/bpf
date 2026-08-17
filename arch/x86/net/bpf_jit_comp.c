@@ -25,6 +25,7 @@ static bool all_callee_regs_used[4] = {true, true, true, true};
 
 struct jit_emit_context {
 	u8 *prog;
+	bool dry_run;
 };
 
 static u8 *emit_code(u8 *ptr, u32 bytes, unsigned int len)
@@ -42,7 +43,10 @@ static u8 *emit_code(u8 *ptr, u32 bytes, unsigned int len)
 
 static void emit_code_jit(struct jit_emit_context *jit, u32 bytes, unsigned int len)
 {
-	jit->prog = emit_code(jit->prog, bytes, len);
+	if (jit->dry_run)
+		jit->prog += len;
+	else
+		jit->prog = emit_code(jit->prog, bytes, len);
 }
 
 #define EMIT(bytes, len) \
@@ -166,7 +170,8 @@ static int bpf_call_depth_emit_accounting(struct jit_emit_context *jit, void *fu
 	int size;
 
 	size = x86_call_depth_emit_accounting(insn_buff, func, ip);
-	memcpy(jit->prog, insn_buff, size);
+	if (!jit->dry_run)
+		memcpy(jit->prog, insn_buff, size);
 
 	jit->prog += size;
 	return size;
@@ -1644,6 +1649,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	int err;
 
 	jit->prog = temp;
+	jit->dry_run = false;
 
 	stack_depth = bpf_prog->aux->stack_depth;
 	out_stack_arg_cnt = bpf_out_stack_arg_cnt(env, bpf_prog);
@@ -3186,8 +3192,10 @@ static int invoke_bpf_prog(const struct btf_func_model *m, struct jit_emit_conte
 		emit_stx(jit, BPF_DW, BPF_REG_FP, BPF_REG_0, -8);
 
 	/* replace 2 nops with JE insn, since jmp target is known */
-	jmp_insn[0] = X86_JE;
-	jmp_insn[1] = jit->prog - jmp_insn - 2;
+	if (!jit->dry_run) {
+		jmp_insn[0] = X86_JE;
+		jmp_insn[1] = jit->prog - jmp_insn - 2;
+	}
 
 	/* arg1: mov rdi, progs[i] */
 	emit_mov_imm64(jit, BPF_REG_1, (long) p >> 32, (u32) (long) p);
@@ -3467,6 +3475,12 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 		orig_call += X86_PATCH_SIZE;
 	}
 
+	/* A sizing pass only advances the cursor; use a synthetic base address. */
+	jit->dry_run = !rw_image;
+	if (jit->dry_run) {
+		rw_image = (void *)PAGE_SIZE;
+		image = rw_image;
+	}
 	jit->prog = rw_image;
 
 	if (flags & BPF_TRAMP_F_INDIRECT) {
@@ -3587,7 +3601,10 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 		 * aligned address of do_fexit.
 		 */
 		for (i = 0; i < fmod_ret->nr_nodes; i++) {
-			struct jit_emit_context branch_jit = { .prog = branches[i] };
+			struct jit_emit_context branch_jit = {
+				.prog = branches[i],
+				.dry_run = jit->dry_run,
+			};
 
 			emit_cond_near_jump(&branch_jit, image + (jit->prog - (u8 *)rw_image),
 					    image + (branches[i] - (u8 *)rw_image), X86_JNE);
@@ -3645,7 +3662,8 @@ static int __arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *rw_im
 	}
 	emit_return(jit, image + (jit->prog - (u8 *)rw_image));
 	/* Make sure the trampoline generation logic doesn't overflow */
-	if (WARN_ON_ONCE(jit->prog > (u8 *)rw_image_end - BPF_INSN_SAFETY)) {
+	if (!jit->dry_run &&
+	    WARN_ON_ONCE(jit->prog > (u8 *)rw_image_end - BPF_INSN_SAFETY)) {
 		ret = -EFAULT;
 		goto cleanup;
 	}
@@ -3704,23 +3722,9 @@ int arch_bpf_trampoline_size(const struct btf_func_model *m, u32 flags,
 			     struct bpf_tramp_nodes *tnodes, void *func_addr)
 {
 	struct bpf_tramp_image im;
-	void *image;
-	int ret;
 
-	/* Allocate a temporary buffer for __arch_prepare_bpf_trampoline().
-	 *
-	 * We cannot use kvmalloc here, because we need image to be in
-	 * module memory range.
-	 * Since it must be writable use bpf_jit_alloc_exec_rw().
-	 */
-	image = bpf_jit_alloc_exec_rw(PAGE_SIZE);
-	if (!image)
-		return -ENOMEM;
-
-	ret = __arch_prepare_bpf_trampoline(&im, image, image + PAGE_SIZE, image,
-					    m, flags, tnodes, func_addr);
-	bpf_jit_free_exec(image);
-	return ret;
+	return __arch_prepare_bpf_trampoline(&im, NULL, NULL, NULL, m, flags,
+					     tnodes, func_addr);
 }
 
 static int emit_bpf_dispatcher(struct jit_emit_context *jit, int a, int b, s64 *progs, u8 *image, u8 *buf)
