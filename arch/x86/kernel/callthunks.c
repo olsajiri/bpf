@@ -298,7 +298,7 @@ static bool is_callthunk(void *addr)
 	return !bcmp(pad, insn_buff, tmpl_size);
 }
 
-int x86_call_depth_emit_accounting(u8 **pprog, void *func, void *ip)
+int x86_call_depth_emit_accounting(u8 **pprog, void *func, void *ip, bool dry_run)
 {
 	unsigned int tmpl_size = SKL_TMPL_SIZE;
 	u8 insn_buff[MAX_PATCH_LEN];
@@ -309,6 +309,11 @@ int x86_call_depth_emit_accounting(u8 **pprog, void *func, void *ip)
 	/* Is function call target a thunk? */
 	if (func && is_callthunk(func))
 		return 0;
+
+	if (dry_run) {
+		*pprog += tmpl_size;
+		return tmpl_size;
+	}
 
 	memcpy(insn_buff, skl_call_thunk_template, tmpl_size);
 	text_poke_apply_relocation(insn_buff, ip, tmpl_size, skl_call_thunk_template, tmpl_size);
