@@ -83,7 +83,8 @@ extern void callthunks_patch_builtin_calls(void);
 extern void callthunks_patch_module_calls(struct callthunk_sites *sites,
 					  struct module *mod);
 extern void *callthunks_translate_call_dest(void *dest);
-extern int x86_call_depth_emit_accounting(u8 **pprog, void *func, void *ip);
+extern int x86_call_depth_emit_accounting(u8 **pprog, void *func, void *ip,
+					  bool dry_run);
 #else
 static __always_inline void callthunks_patch_builtin_calls(void) {}
 static __always_inline void
@@ -94,7 +95,7 @@ static __always_inline void *callthunks_translate_call_dest(void *dest)
 	return dest;
 }
 static __always_inline int x86_call_depth_emit_accounting(u8 **pprog,
-							  void *func, void *ip)
+							  void *func, void *ip, bool dry_run)
 {
 	return 0;
 }
