@@ -517,6 +517,7 @@ extern const struct bench bench_trig_syscall_count;
 extern const struct bench bench_trig_kernel_count;
 extern const struct bench bench_trig_user_ringbuf_timer;
 extern const struct bench bench_trig_user_ringbuf_syscall;
+extern const struct bench bench_trig_unix_socket;
 
 /* batched, staying mostly in-kernel benchmarks */
 extern const struct bench bench_trig_kprobe;
@@ -607,6 +608,7 @@ static const struct bench *benchs[] = {
 	&bench_trig_syscall_count,
 	&bench_trig_user_ringbuf_timer,
 	&bench_trig_user_ringbuf_syscall,
+	&bench_trig_unix_socket,
 	/* batched, staying mostly in-kernel triggers */
 	&bench_trig_kprobe,
 	&bench_trig_kretprobe,

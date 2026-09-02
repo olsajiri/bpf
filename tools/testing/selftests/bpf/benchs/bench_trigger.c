@@ -2,6 +2,11 @@
 /* Copyright (c) 2020 Facebook */
 #define _GNU_SOURCE
 #include <argp.h>
+#include <endian.h>
+#include <stddef.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <stdint.h>
 #include "bpf_util.h"
@@ -10,21 +15,29 @@
 #include "trace_helpers.h"
 
 #define MAX_TRIG_BATCH_ITERS 1000
+#define UNIX_SOCKET_EVENT_SIZE_DEFAULT 432
+#define UNIX_SOCKET_EVENT_SIZE_MIN 8
+#define UNIX_SOCKET_PATH_LEN sizeof(((struct sockaddr_un *)0)->sun_path)
 
 static struct {
 	__u32 batch_iters;
 	__u32 user_rb_size;
 	__u64 user_rb_timer_ns;
+	__u32 unix_socket_event_size;
+	int unix_socket_queue_size;
 } args = {
 	.batch_iters = 100,
 	.user_rb_size = 4096,
 	.user_rb_timer_ns = 1000000,
+	.unix_socket_event_size = UNIX_SOCKET_EVENT_SIZE_DEFAULT,
 };
 
 enum {
 	ARG_TRIG_BATCH_ITERS = 7000,
 	ARG_TRIG_USER_RB_TIMER_NS,
 	ARG_TRIG_USER_RB_SIZE,
+	ARG_TRIG_UNIX_SOCKET_EVENT_SIZE,
+	ARG_TRIG_UNIX_SOCKET_QUEUE_SIZE,
 };
 
 static const struct argp_option opts[] = {
@@ -34,6 +47,10 @@ static const struct argp_option opts[] = {
 		"User ring buffer drain timer interval in nanoseconds"},
 	{ "user-rb-size", ARG_TRIG_USER_RB_SIZE, "BYTES", 0,
 		"User ring buffer size in bytes"},
+	{ "unix-socket-event-size", ARG_TRIG_UNIX_SOCKET_EVENT_SIZE, "BYTES", 0,
+		"Unix socket event size in bytes"},
+	{ "unix-socket-queue-size", ARG_TRIG_UNIX_SOCKET_QUEUE_SIZE, "BYTES", 0,
+		"Unix socket send and receive queue size in bytes"},
 	{},
 };
 
@@ -72,6 +89,29 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		}
 		args.user_rb_size = value;
 		break;
+	case ARG_TRIG_UNIX_SOCKET_EVENT_SIZE:
+		errno = 0;
+		value = strtoull(arg, &end, 10);
+		if (errno || end == arg || *end || arg[0] == '-' ||
+		    value < UNIX_SOCKET_EVENT_SIZE_MIN || value > INT_MAX) {
+			fprintf(stderr,
+				"--unix-socket-event-size must be between %d and %d bytes\n",
+				UNIX_SOCKET_EVENT_SIZE_MIN, INT_MAX);
+			argp_usage(state);
+		}
+		args.unix_socket_event_size = value;
+		break;
+	case ARG_TRIG_UNIX_SOCKET_QUEUE_SIZE:
+		errno = 0;
+		value = strtoull(arg, &end, 10);
+		if (errno || end == arg || *end || arg[0] == '-' ||
+		    !value || value > INT_MAX) {
+			fprintf(stderr, "--unix-socket-queue-size must be between 1 and %d bytes\n",
+				INT_MAX);
+			argp_usage(state);
+		}
+		args.unix_socket_queue_size = value;
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -95,6 +135,12 @@ static struct trigger_ctx {
 	struct user_ring_buffer *user_ringbuf;
 	bool usermode_counters;
 	int driver_prog_fd;
+	int unix_listener_fd;
+	int unix_producer_fd;
+	int unix_consumer_fd;
+	char unix_socket_path[UNIX_SOCKET_PATH_LEN];
+	long unix_hits;
+	long unix_drops;
 } ctx;
 
 static struct counter base_hits[MAX_BUCKETS];
@@ -140,6 +186,173 @@ static void trigger_user_ringbuf_validate(void)
 		fprintf(stderr, "benchmark requires exactly one producer!\n");
 		exit(1);
 	}
+}
+
+static void unix_socket_cleanup(void)
+{
+	if (ctx.unix_producer_fd >= 0)
+		close(ctx.unix_producer_fd);
+	if (ctx.unix_consumer_fd >= 0)
+		close(ctx.unix_consumer_fd);
+	if (ctx.unix_listener_fd >= 0)
+		close(ctx.unix_listener_fd);
+	if (ctx.unix_socket_path[0])
+		unlink(ctx.unix_socket_path);
+}
+
+static void unix_socket_fail(const char *op)
+{
+	fprintf(stderr, "%s failed: %s\n", op, strerror(errno));
+	exit(1);
+}
+
+static void unix_socket_set_queue_size(int fd, int optname, const char *op)
+{
+	if (!args.unix_socket_queue_size)
+		return;
+
+	if (setsockopt(fd, SOL_SOCKET, optname,
+		       &args.unix_socket_queue_size,
+		       sizeof(args.unix_socket_queue_size)))
+		unix_socket_fail(op);
+}
+
+static void unix_socket_setup(void)
+{
+	struct sockaddr_un addr = {};
+	int fd, err;
+	socklen_t addr_len;
+	char path[] = "/tmp/bpf-trigger-unix-XXXXXX";
+
+	if (env.producer_cnt != 1 || env.consumer_cnt != 1) {
+		fprintf(stderr, "benchmark requires exactly one producer and one consumer\n");
+		exit(1);
+	}
+
+	ctx.unix_listener_fd = -1;
+	ctx.unix_producer_fd = -1;
+	ctx.unix_consumer_fd = -1;
+
+	fd = mkstemp(path);
+	if (fd < 0)
+		unix_socket_fail("mkstemp");
+	close(fd);
+	if (unlink(path))
+		unix_socket_fail("unlink temporary path");
+	strncpy(ctx.unix_socket_path, path, sizeof(ctx.unix_socket_path));
+
+	ctx.unix_listener_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+	if (ctx.unix_listener_fd < 0)
+		unix_socket_fail("socket(AF_UNIX, SOCK_SEQPACKET)");
+
+	addr.sun_family = AF_UNIX;
+	memcpy(addr.sun_path, ctx.unix_socket_path,
+	       strlen(ctx.unix_socket_path) + 1);
+	addr_len = offsetof(struct sockaddr_un, sun_path) +
+		   strlen(ctx.unix_socket_path) + 1;
+	err = bind(ctx.unix_listener_fd, (struct sockaddr *)&addr, addr_len);
+	if (err)
+		unix_socket_fail("bind");
+	if (listen(ctx.unix_listener_fd, 1))
+		unix_socket_fail("listen");
+
+	atexit(unix_socket_cleanup);
+}
+
+static void *unix_socket_producer(void *input)
+{
+	struct sockaddr_un addr = {};
+	__u32 record_size = htole32(args.unix_socket_event_size);
+	char *event;
+	int fd;
+
+	(void)input;
+	event = calloc(1, args.unix_socket_event_size);
+	if (!event) {
+		fprintf(stderr, "failed to allocate Unix socket event: %s\n",
+			strerror(errno));
+		exit(1);
+	}
+	event[0] = 29; /* MSG_OP_JAVA, as used by the Java monitoring agent. */
+	memcpy(event + 4, &record_size, sizeof(record_size));
+
+	fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+	if (fd < 0)
+		unix_socket_fail("producer socket");
+	ctx.unix_producer_fd = fd;
+	unix_socket_set_queue_size(fd, SO_SNDBUF,
+				   "setsockopt(SO_SNDBUF)");
+
+	addr.sun_family = AF_UNIX;
+	memcpy(addr.sun_path, ctx.unix_socket_path,
+	       strlen(ctx.unix_socket_path) + 1);
+	if (connect(fd, (struct sockaddr *)&addr,
+		    offsetof(struct sockaddr_un, sun_path) +
+		    strlen(ctx.unix_socket_path) + 1))
+		unix_socket_fail("producer connect");
+
+	while (true) {
+		ssize_t sent;
+
+		sent = send(fd, event, args.unix_socket_event_size,
+			    MSG_DONTWAIT | MSG_NOSIGNAL);
+		if (sent == (ssize_t)args.unix_socket_event_size)
+			continue;
+
+		atomic_inc(&ctx.unix_drops);
+	}
+
+	return NULL;
+}
+
+static void *unix_socket_consumer(void *input)
+{
+	char *event;
+	struct iovec iov = {
+		.iov_base = NULL,
+		.iov_len = 0,
+	};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+	};
+	ssize_t received;
+
+	(void)input;
+	ctx.unix_consumer_fd = accept(ctx.unix_listener_fd, NULL, NULL);
+	if (ctx.unix_consumer_fd < 0)
+		unix_socket_fail("consumer accept");
+	unix_socket_set_queue_size(ctx.unix_consumer_fd, SO_RCVBUF,
+				   "setsockopt(SO_RCVBUF)");
+
+	event = malloc(args.unix_socket_event_size);
+	if (!event) {
+		fprintf(stderr, "failed to allocate Unix socket event: %s\n",
+			strerror(errno));
+		exit(1);
+	}
+	iov.iov_base = event;
+	iov.iov_len = args.unix_socket_event_size;
+
+	while (true) {
+		msg.msg_flags = 0;
+		received = recvmsg(ctx.unix_consumer_fd, &msg, 0);
+		if (received < 0 && errno == EINTR)
+			continue;
+		if (received == (ssize_t)args.unix_socket_event_size &&
+		    !(msg.msg_flags & MSG_TRUNC))
+			atomic_inc(&ctx.unix_hits);
+		else
+			atomic_inc(&ctx.unix_drops);
+	}
+
+	return NULL;
+}
+
+static void unix_socket_measure(struct bench_res *res)
+{
+	res->hits = atomic_swap(&ctx.unix_hits, 0);
+	res->drops = atomic_swap(&ctx.unix_drops, 0);
 }
 
 static void *trigger_producer(void *input)
@@ -841,6 +1054,16 @@ const struct bench bench_trig_user_ringbuf_syscall = {
 	.setup = trigger_user_ringbuf_syscall_setup,
 	.producer_thread = trigger_user_ringbuf_syscall_producer,
 	.measure = trigger_user_ringbuf_measure,
+	.report_progress = hits_drops_report_progress,
+	.report_final = hits_drops_report_final,
+};
+
+const struct bench bench_trig_unix_socket = {
+	.name = "trig-unix-socket",
+	.setup = unix_socket_setup,
+	.producer_thread = unix_socket_producer,
+	.consumer_thread = unix_socket_consumer,
+	.measure = unix_socket_measure,
 	.report_progress = hits_drops_report_progress,
 	.report_final = hits_drops_report_final,
 };
