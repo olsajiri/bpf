@@ -6,6 +6,7 @@ def_tests=( \
 	usermode-count kernel-count syscall-count \
 	user-ringbuf-timer user-ringbuf-syscall \
 	unix-socket \
+	shared-memory shared-memory-eventfd \
 	fentry fexit fmodret \
 	rawtp tp \
 	kprobe kprobe-multi kprobe-multi-all \
@@ -22,10 +23,15 @@ p=${PROD_CNT:-1}
 for t in "${tests[@]}"; do
 	prod_cnt=$p
 	args=(-w2 -d5 -a -c0)
-	if [ "$t" = unix-socket ]; then
+	case "$t" in
+	user-ringbuf-timer|user-ringbuf-syscall)
+		prod_cnt=1
+		;;
+	unix-socket|shared-memory|shared-memory-eventfd)
 		prod_cnt=1
 		args[-1]=-c1
-	fi
+		;;
+	esac
 	args+=(-p$prod_cnt)
 	summary=$(sudo ./bench "${args[@]}" trig-$t | tail -n1 | cut -d'(' -f1 | cut -d' ' -f3-)
 	printf "%-20s: %s\n" $t "$summary"

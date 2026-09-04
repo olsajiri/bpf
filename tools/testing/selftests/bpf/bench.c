@@ -284,6 +284,7 @@ extern struct argp bench_hashmap_lookup_argp;
 extern struct argp bench_local_storage_create_argp;
 extern struct argp bench_htab_mem_argp;
 extern struct argp bench_trigger_batch_argp;
+extern struct argp bench_shared_memory_argp;
 extern struct argp bench_crypto_argp;
 extern struct argp bench_sockmap_argp;
 extern struct argp bench_lpm_trie_map_argp;
@@ -303,6 +304,7 @@ static const struct argp_child bench_parsers[] = {
 	{ &bench_local_storage_create_argp, 0, "local-storage-create benchmark", 0 },
 	{ &bench_htab_mem_argp, 0, "hash map memory benchmark", 0 },
 	{ &bench_trigger_batch_argp, 0, "BPF triggering benchmark", 0 },
+	{ &bench_shared_memory_argp, 0, "Shared memory triggering benchmark", 0 },
 	{ &bench_crypto_argp, 0, "bpf crypto benchmark", 0 },
 	{ &bench_sockmap_argp, 0, "bpf sockmap benchmark", 0 },
 	{ &bench_lpm_trie_map_argp, 0, "LPM trie map benchmark", 0 },
@@ -518,6 +520,8 @@ extern const struct bench bench_trig_kernel_count;
 extern const struct bench bench_trig_user_ringbuf_timer;
 extern const struct bench bench_trig_user_ringbuf_syscall;
 extern const struct bench bench_trig_unix_socket;
+extern const struct bench bench_trig_shared_memory;
+extern const struct bench bench_trig_shared_memory_eventfd;
 
 /* batched, staying mostly in-kernel benchmarks */
 extern const struct bench bench_trig_kprobe;
@@ -609,6 +613,8 @@ static const struct bench *benchs[] = {
 	&bench_trig_user_ringbuf_timer,
 	&bench_trig_user_ringbuf_syscall,
 	&bench_trig_unix_socket,
+	&bench_trig_shared_memory,
+	&bench_trig_shared_memory_eventfd,
 	/* batched, staying mostly in-kernel triggers */
 	&bench_trig_kprobe,
 	&bench_trig_kretprobe,
