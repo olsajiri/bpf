@@ -41,12 +41,75 @@
 #include <linux/perf_event.h>
 #include <linux/execmem.h>
 #include <linux/cleanup.h>
+#include <linux/linkage.h>
+#include <linux/stringify.h>
 #include <linux/wait.h>
 
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
 #include <asm/errno.h>
+#ifdef CONFIG_X86
+#include <asm/ibt.h>
+#endif
 #include <linux/uaccess.h>
+
+#ifdef CONFIG_X86
+#define KPROBE_MULTI_MAX_FUNCS 10000
+#define KPROBE_MULTI_FUNC_SIZE 24
+#define KPROBE_MULTI_PROBE_OFF 8
+
+#if defined(CONFIG_MITIGATION_RETHUNK)
+#define KPROBE_MULTI_RET ASM_RET
+#define KPROBE_MULTI_RET_SIZE 5
+#elif defined(CONFIG_MITIGATION_SLS)
+#define KPROBE_MULTI_RET ASM_RET
+#define KPROBE_MULTI_RET_SIZE 2
+#else
+#define KPROBE_MULTI_RET ASM_RET
+#define KPROBE_MULTI_RET_SIZE 1
+#endif
+
+#define KPROBE_MULTI_TAIL_NOPS \
+	(KPROBE_MULTI_FUNC_SIZE - KPROBE_MULTI_PROBE_OFF - 7 - \
+	 KPROBE_MULTI_RET_SIZE)
+
+extern char kprobe_multi_kernel_func_0[];
+EXPORT_SYMBOL_GPL(kprobe_multi_kernel_func_0);
+
+/*
+ * Keep these functions at a fixed size so the sample module can place
+ * probes at the same offset in every function.
+ */
+asm (".pushsection .text, \"ax\", @progbits\n\t"
+	".macro KPROBE_MULTI_FUNC name\n\t"
+	".type \\name, @function\n\t"
+	"\\name:\n\t"
+	ASM_ENDBR
+	".rept " __stringify(KPROBE_MULTI_PROBE_OFF - ENDBR_INSN_SIZE)
+	"\n\t"
+	"nop\n\t"
+	".endr\n\t"
+	"1:\n\t"
+	ASM_ANNOTATE_LABEL(1b, ANNOTYPE_NOENDBR) "\n\t"
+	".rept 7\n\t"
+	"nop\n\t"
+	".endr\n\t"
+	".rept " __stringify(KPROBE_MULTI_TAIL_NOPS) "\n\t"
+	"nop\n\t"
+	".endr\n\t"
+	KPROBE_MULTI_RET
+	".size \\name, .-\\name\n\t"
+	".endm\n\t"
+	".macro KPROBE_MULTI_FUNC_LOCAL\n\t"
+	"KPROBE_MULTI_FUNC kprobe_multi_kernel_func_\\@\n\t"
+	".endm\n\t"
+	".globl kprobe_multi_kernel_func_0\n\t"
+	"KPROBE_MULTI_FUNC kprobe_multi_kernel_func_0\n\t"
+	".rept " __stringify(KPROBE_MULTI_MAX_FUNCS - 1) "\n\t"
+	"KPROBE_MULTI_FUNC_LOCAL\n\t"
+	".endr\n\t"
+	".popsection\n");
+#endif
 
 #define KPROBE_HASH_BITS 6
 #define KPROBE_TABLE_SIZE (1 << KPROBE_HASH_BITS)
