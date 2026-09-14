@@ -158,6 +158,7 @@ struct btf_struct_metas {
 extern const struct file_operations btf_fops;
 
 const char *btf_get_name(const struct btf *btf);
+const void *btf_raw_data(const struct btf *btf, u32 *data_size);
 void btf_get(struct btf *btf);
 void btf_put(struct btf *btf);
 const struct btf_header *btf_header(const struct btf *btf);
@@ -236,6 +237,7 @@ u32 btf_obj_id(const struct btf *btf);
 bool btf_is_kernel(const struct btf *btf);
 bool btf_is_module(const struct btf *btf);
 bool btf_is_vmlinux(const struct btf *btf);
+bool btf_is_vmlinux_inline(const struct btf *btf);
 struct module *btf_try_get_module(const struct btf *btf);
 u32 btf_nr_types(const struct btf *btf);
 u32 btf_named_start_id(const struct btf *btf, bool own);
@@ -617,6 +619,7 @@ __u32 *btf_field_iter_next(struct btf_field_iter *it);
 const char *btf_name_by_offset(const struct btf *btf, u32 offset);
 const char *btf_str_by_offset(const struct btf *btf, u32 offset);
 struct btf *btf_parse_vmlinux(void);
+struct btf *btf_parse_vmlinux_inline(void);
 struct btf *bpf_prog_get_target_btf(const struct bpf_prog *prog);
 u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
 int btf_kfunc_check_flag(const struct btf *btf, u32 kfunc_btf_id, u32 flag);
