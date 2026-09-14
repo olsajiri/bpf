@@ -268,6 +268,7 @@ struct bpf_kfunc_meta {
 };
 
 struct btf *btf_vmlinux;
+static struct btf *btf_vmlinux_inline;
 
 typedef struct argno {
 	int argno;
@@ -317,6 +318,7 @@ static const char *btf_type_name(const struct btf *btf, u32 id)
 
 static DEFINE_MUTEX(bpf_verifier_lock);
 static DEFINE_MUTEX(btf_vmlinux_lock);
+static DEFINE_MUTEX(btf_vmlinux_inline_lock);
 static DEFINE_MUTEX(bpf_percpu_ma_lock);
 
 __printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
@@ -22602,6 +22604,48 @@ struct btf *bpf_get_btf_vmlinux(void)
 		}
 		mutex_unlock(&btf_vmlinux_lock);
 	}
+	return btf;
+}
+
+bool bpf_publish_btf_vmlinux_inline(struct btf *btf)
+{
+	bool published = false;
+
+	mutex_lock(&btf_vmlinux_inline_lock);
+	if (!btf_vmlinux_inline) {
+		smp_store_release(&btf_vmlinux_inline, btf);
+		published = true;
+	}
+	mutex_unlock(&btf_vmlinux_inline_lock);
+
+	return published;
+}
+
+struct btf *bpf_get_btf_vmlinux_inline(void)
+{
+	struct btf *btf = smp_load_acquire(&btf_vmlinux_inline);
+	int err;
+
+	if (btf || !IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE))
+		return btf;
+
+	if (IS_MODULE(CONFIG_DEBUG_INFO_BTF_INLINE)) {
+		err = request_module("btf_vmlinux_inline");
+		if (err)
+			return ERR_PTR(err);
+
+		btf = smp_load_acquire(&btf_vmlinux_inline);
+		return btf ?: ERR_PTR(-ENODEV);
+	}
+
+	mutex_lock(&btf_vmlinux_inline_lock);
+	btf = btf_vmlinux_inline;
+	if (!btf) {
+		btf = btf_parse_vmlinux_inline();
+		smp_store_release(&btf_vmlinux_inline, btf);
+	}
+	mutex_unlock(&btf_vmlinux_inline_lock);
+
 	return btf;
 }
 
