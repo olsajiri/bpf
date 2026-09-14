@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <sys/prctl.h>
 #include <test_progs.h>
+#include <bpf/btf.h>
 #include "kprobe_multi.skel.h"
 #include "trace_helpers.h"
 #include "kprobe_multi_empty.skel.h"
@@ -216,6 +217,136 @@ static void test_attach_api_syms(void)
 	opts.syms = syms;
 	opts.cnt = ARRAY_SIZE(syms);
 	test_attach_api(NULL, &opts);
+}
+
+struct inline_symbol {
+	const char *name;
+	__u32 loc_cnt;
+};
+
+static int collect_inline_symbols(const struct btf *inline_btf,
+					  struct inline_symbol *symbols, int max_symbols)
+{
+	const struct btf *base_btf = btf__base_btf(inline_btf);
+	__u32 base_cnt = btf__type_cnt(base_btf);
+	__u32 nr_types = btf__type_cnt(inline_btf);
+	int symbol_cnt = 0;
+	__u32 i, j;
+
+	for (i = base_cnt; i < nr_types; i++) {
+		const struct btf_type *t = btf__type_by_id(inline_btf, i);
+		const struct btf_loc *loc;
+
+		if (!t || !btf_is_locsec(t))
+			continue;
+
+		loc = btf_locsec_locs(t);
+		for (j = 0; j < btf_vlen(t); j++, loc++) {
+			const struct btf_type *func;
+			const char *name;
+			int k;
+
+			func = btf__type_by_id(inline_btf, loc->func);
+			if (!func || !btf_is_func(func))
+				continue;
+			name = btf__name_by_offset(inline_btf, func->name_off);
+			if (!name || !name[0])
+				continue;
+
+			for (k = 0; k < symbol_cnt; k++) {
+				if (!strcmp(symbols[k].name, name))
+					break;
+			}
+			if (k == symbol_cnt) {
+				if (symbol_cnt == max_symbols)
+					return symbol_cnt;
+				symbols[symbol_cnt++] = (struct inline_symbol){
+					.name = name,
+					.loc_cnt = 1,
+				};
+			} else {
+				symbols[k].loc_cnt++;
+			}
+		}
+	}
+
+	return symbol_cnt;
+}
+
+static void test_attach_api_inline(void)
+{
+	struct inline_symbol symbols[64];
+	struct btf *vmlinux_btf = NULL, *inline_btf = NULL;
+	struct kprobe_multi *skel = NULL;
+	struct bpf_link *link = NULL;
+	struct bpf_link_info info;
+	const char *sym;
+	__u32 info_len;
+	int symbol_cnt, err, i, pass;
+
+	vmlinux_btf = btf__load_vmlinux_btf();
+	if (!ASSERT_OK_PTR(vmlinux_btf, "btf__load_vmlinux_btf"))
+		return;
+
+	inline_btf = btf__parse_split("/sys/kernel/btf/vmlinux.inline", vmlinux_btf);
+	err = libbpf_get_error(inline_btf);
+	if (err == -ENOENT) {
+		test__skip();
+		goto cleanup;
+	}
+	if (!ASSERT_OK(err, "btf__parse_split"))
+		goto cleanup;
+
+	symbol_cnt = collect_inline_symbols(inline_btf, symbols, ARRAY_SIZE(symbols));
+	if (!ASSERT_GT(symbol_cnt, 0, "inline_symbols"))
+		goto cleanup;
+
+	skel = kprobe_multi__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi__open_and_load"))
+		goto cleanup;
+
+	/* Prefer an inline-only name to cover the symbol lookup fallback. */
+	for (pass = 0; pass < 2 && !link; pass++) {
+		for (i = 0; i < symbol_cnt; i++) {
+			bool inline_only = !ksym_get_addr(symbols[i].name);
+
+			LIBBPF_OPTS(bpf_kprobe_multi_opts, opts,
+					.syms = &sym,
+					.cnt = 1,
+					.inline_probes = true);
+
+			if (inline_only != (pass == 0))
+				continue;
+
+			sym = symbols[i].name;
+			link = bpf_program__attach_kprobe_multi_opts(
+				skel->progs.test_kprobe_inline, NULL, &opts);
+			if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts")) {
+				link = NULL;
+				continue;
+			}
+			memset(&info, 0, sizeof(info));
+			info_len = sizeof(info);
+			err = bpf_link_get_info_by_fd(bpf_link__fd(link), &info,
+						      &info_len);
+			if (!ASSERT_OK(err, "bpf_link_get_info_by_fd") ||
+			    !ASSERT_EQ(info.kprobe_multi.flags,
+				       BPF_F_KPROBE_MULTI_INLINE,
+				       "inline_probe_flag") ||
+			    !ASSERT_GE(info.kprobe_multi.count, symbols[i].loc_cnt,
+				       "inline_probe_count"))
+				goto cleanup;
+			break;
+		}
+	}
+	if (!ASSERT_OK_PTR(link, "inline_kprobe_multi_attach"))
+		goto cleanup;
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi__destroy(skel);
+	btf__free(inline_btf);
+	btf__free(vmlinux_btf);
 }
 
 static void test_attach_api_fails(void)
@@ -732,6 +863,8 @@ void test_kprobe_multi_test(void)
 		test_attach_api_addrs();
 	if (test__start_subtest("attach_api_syms"))
 		test_attach_api_syms();
+	if (test__start_subtest("attach_api_inline"))
+		test_attach_api_inline();
 	if (test__start_subtest("attach_api_fails"))
 		test_attach_api_fails();
 	if (test__start_subtest("attach_override"))
