@@ -36,6 +36,10 @@ __u64 kretprobe_test6_result = 0;
 __u64 kretprobe_test7_result = 0;
 __u64 kretprobe_test8_result = 0;
 
+__u64 kprobe_inline_arg_cnt;
+__u64 kprobe_inline_arg0;
+__s64 kprobe_inline_arg_err;
+
 static void kprobe_multi_check(void *ctx, bool is_return)
 {
 	if (bpf_get_current_pid_tgid() >> 32 != pid)
@@ -101,6 +105,19 @@ SEC("kprobe.multi")
 int test_kprobe_manual(struct pt_regs *ctx)
 {
 	kprobe_multi_check(ctx, false);
+	return 0;
+}
+
+SEC("kprobe.multi")
+int test_kprobe_inline(struct pt_regs *ctx)
+{
+	if (bpf_get_current_pid_tgid() >> 32 != pid)
+		return 0;
+
+	kprobe_inline_arg_cnt = bpf_get_func_arg_cnt(ctx);
+	if (kprobe_inline_arg_cnt)
+		kprobe_inline_arg_err = bpf_get_func_arg(ctx, 0,
+							&kprobe_inline_arg0);
 	return 0;
 }
 
