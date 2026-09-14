@@ -1242,6 +1242,9 @@ static const struct bpf_func_proto bpf_get_func_arg_proto = {
 	.arg3_size	= sizeof(u64),
 };
 
+static const struct bpf_func_proto bpf_get_func_arg_proto_kprobe_multi;
+static const struct bpf_func_proto bpf_get_func_arg_cnt_proto_kprobe_multi;
+
 BPF_CALL_2(get_func_ret, void *, ctx, u64 *, value)
 {
 	/* This helper call is inlined by verifier. */
@@ -1784,6 +1787,10 @@ tracing_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_d_path:
 		return &bpf_d_path_proto;
 	case BPF_FUNC_get_func_arg:
+#ifdef CONFIG_FPROBE
+		if (is_kprobe_multi(prog))
+			return &bpf_get_func_arg_proto_kprobe_multi;
+#endif
 		if (bpf_prog_has_trampoline(prog) ||
 		    prog->expected_attach_type == BPF_TRACE_RAW_TP)
 			return &bpf_get_func_arg_proto;
@@ -1791,6 +1798,10 @@ tracing_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_get_func_ret:
 		return bpf_prog_has_trampoline(prog) ? &bpf_get_func_ret_proto : NULL;
 	case BPF_FUNC_get_func_arg_cnt:
+#ifdef CONFIG_FPROBE
+		if (is_kprobe_multi(prog))
+			return &bpf_get_func_arg_cnt_proto_kprobe_multi;
+#endif
 		if (bpf_prog_has_trampoline(prog) ||
 		    prog->expected_attach_type == BPF_TRACE_RAW_TP)
 			return &bpf_get_func_arg_cnt_proto;
@@ -2354,7 +2365,16 @@ struct bpf_kprobe_multi_kprobe {
 struct bpf_kprobe_multi_addr {
 	unsigned long addr;
 	u64 cookie;
+	const char *name;
+	const struct btf *btf;
+	const struct btf_type *loc_proto;
+	u32 loc_proto_id;
 	bool inline_probe;
+};
+
+struct bpf_kprobe_multi_inline_info {
+	const struct btf *btf;
+	const struct btf_type *loc_proto;
 };
 
 struct bpf_kprobe_multi_link {
@@ -2364,6 +2384,7 @@ struct bpf_kprobe_multi_link {
 	u64 *cookies;
 	struct bpf_kprobe_multi_kprobe *inline_probes;
 	struct kprobe **inline_kps;
+	struct bpf_kprobe_multi_inline_info *inline_info;
 	u32 cnt;
 	u32 inline_cnt;
 	u32 mods_cnt;
@@ -2457,19 +2478,38 @@ static void free_user_syms(struct user_syms *us)
 
 static int symbols_cmp_r(const void *a, const void *b, const void *priv);
 
+static int symbols_cmp(const void *a, const void *b)
+{
+	return symbols_cmp_r(a, b, NULL);
+}
+
 static int bpf_kprobe_multi_addr_cmp(const void *a, const void *b)
 {
 	const struct bpf_kprobe_multi_addr *addr_a = a;
 	const struct bpf_kprobe_multi_addr *addr_b = b;
+	int ret;
 
-	if (addr_a->addr == addr_b->addr)
+	if (addr_a->addr != addr_b->addr)
+		return addr_a->addr < addr_b->addr ? -1 : 1;
+	if (addr_a->inline_probe != addr_b->inline_probe)
+		return addr_a->inline_probe ? 1 : -1;
+	if (!addr_a->inline_probe)
 		return 0;
-	return addr_a->addr < addr_b->addr ? -1 : 1;
+	ret = strcmp(addr_a->name, addr_b->name);
+	if (ret)
+		return ret;
+	if (addr_a->loc_proto_id == addr_b->loc_proto_id)
+		return 0;
+	return addr_a->loc_proto_id < addr_b->loc_proto_id ? -1 : 1;
 }
 
 static int bpf_kprobe_multi_add_inline_addr(struct bpf_kprobe_multi_addr **addrs,
 						    u32 *cnt, u32 *cap,
-						    unsigned long addr, u64 cookie)
+						    unsigned long addr, u64 cookie,
+						    const char *name,
+						    const struct btf *btf,
+						    const struct btf_type *loc_proto,
+						    u32 loc_proto_id)
 {
 	struct bpf_kprobe_multi_addr *new_addrs;
 	u32 new_cap;
@@ -2480,6 +2520,10 @@ static int bpf_kprobe_multi_add_inline_addr(struct bpf_kprobe_multi_addr **addrs
 		(*addrs)[*cnt] = (struct bpf_kprobe_multi_addr){
 			.addr = addr,
 			.cookie = cookie,
+			.name = name,
+			.btf = btf,
+			.loc_proto = loc_proto,
+			.loc_proto_id = loc_proto_id,
 			.inline_probe = true,
 		};
 		(*cnt)++;
@@ -2498,6 +2542,10 @@ static int bpf_kprobe_multi_add_inline_addr(struct bpf_kprobe_multi_addr **addrs
 	(*addrs)[*cnt] = (struct bpf_kprobe_multi_addr){
 		.addr = addr,
 		.cookie = cookie,
+		.name = name,
+		.btf = btf,
+		.loc_proto = loc_proto,
+		.loc_proto_id = loc_proto_id,
 		.inline_probe = true,
 	};
 	(*cnt)++;
@@ -2532,6 +2580,10 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 		if (!ftrace_lookup_symbols(&syms[i], 1, &addr)) {
 			addrs[*resolved_cnt].addr = addr;
 			addrs[*resolved_cnt].cookie = cookies ? cookies[i] : 0;
+			addrs[*resolved_cnt].name = syms[i];
+			addrs[*resolved_cnt].btf = NULL;
+			addrs[*resolved_cnt].loc_proto = NULL;
+			addrs[*resolved_cnt].loc_proto_id = 0;
 			addrs[*resolved_cnt].inline_probe = false;
 			(*resolved_cnt)++;
 			found[i] = 1;
@@ -2560,6 +2612,7 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 			const struct btf_type *func;
 			const char *name;
 			const char **sym;
+			const struct btf_type *loc_proto;
 			unsigned long addr;
 			u32 sym_idx;
 
@@ -2569,7 +2622,7 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 			name = btf_name_by_offset(inline_btf, func->name_off);
 			if (!name)
 				continue;
-			sym = bsearch(&name, syms, cnt, sizeof(*syms), symbols_cmp_r);
+			sym = bsearch(&name, syms, cnt, sizeof(*syms), symbols_cmp);
 			if (!sym)
 				continue;
 			sym_idx = sym - syms;
@@ -2578,9 +2631,13 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 				goto out;
 			}
 			addr = (unsigned long)_text + loc->offset;
+			loc_proto = loc->loc_proto ?
+				btf_type_by_id(inline_btf, loc->loc_proto) : NULL;
 			err = bpf_kprobe_multi_add_inline_addr(&addrs, resolved_cnt,
 							       &cap, addr,
-							       cookies ? cookies[sym_idx] : 0);
+							       cookies ? cookies[sym_idx] : 0,
+							       name, inline_btf, loc_proto,
+							       loc->loc_proto);
 			if (err)
 				goto out;
 			found[sym_idx] = 2;
@@ -2634,6 +2691,7 @@ static void bpf_kprobe_multi_link_dealloc(struct bpf_link *link)
 	kvfree(kmulti_link->cookies);
 	kvfree(kmulti_link->inline_kps);
 	kvfree(kmulti_link->inline_probes);
+	kvfree(kmulti_link->inline_info);
 	kfree(kmulti_link->mods);
 	kfree(kmulti_link);
 }
@@ -2782,6 +2840,243 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 			       session_ctx.run_ctx);
 	return run_ctx->entry_ip;
 }
+
+static const struct bpf_kprobe_multi_inline_info *
+bpf_kprobe_multi_inline_info_for_ip(struct bpf_kprobe_multi_run_ctx *run_ctx)
+{
+	struct bpf_kprobe_multi_link *link = run_ctx->link;
+	unsigned long *addr;
+	unsigned long entry_ip = run_ctx->entry_ip;
+
+	if (!link->inline_info)
+		return NULL;
+
+	addr = bsearch(&entry_ip, link->addrs, link->cnt, sizeof(entry_ip),
+		       bpf_kprobe_multi_addrs_cmp);
+	if (!addr)
+		return NULL;
+
+	return &link->inline_info[addr - link->addrs];
+}
+
+static int bpf_kprobe_multi_read_reg(struct pt_regs *regs, u32 regno,
+					     u64 *value)
+{
+#ifdef CONFIG_X86_64
+	switch (regno) {
+	case 0:
+		*value = regs->ax;
+		break;
+	case 1:
+		*value = regs->dx;
+		break;
+	case 2:
+		*value = regs->cx;
+		break;
+	case 3:
+		*value = regs->bx;
+		break;
+	case 4:
+		*value = regs->si;
+		break;
+	case 5:
+		*value = regs->di;
+		break;
+	case 6:
+		*value = regs->bp;
+		break;
+	case 7:
+		*value = regs->sp;
+		break;
+	case 8:
+		*value = regs->r8;
+		break;
+	case 9:
+		*value = regs->r9;
+		break;
+	case 10:
+		*value = regs->r10;
+		break;
+	case 11:
+		*value = regs->r11;
+		break;
+	case 12:
+		*value = regs->r12;
+		break;
+	case 13:
+		*value = regs->r13;
+		break;
+	case 14:
+		*value = regs->r14;
+		break;
+	case 15:
+		*value = regs->r15;
+		break;
+	case 16:
+		*value = regs->ip;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+static int bpf_kprobe_multi_eval_loc_param(const struct btf_type *param,
+						 struct pt_regs *regs, u64 *value)
+{
+	const struct btf_loc_param *loc_param;
+	const u32 *data;
+	u64 result = 0, reg_value;
+	u32 flags, vlen, size, part_size;
+	unsigned long addr;
+	s32 offset;
+	int err, i;
+
+	if (!param)
+		return -ENOENT;
+
+	size = param->size;
+	if (!size)
+		return -ENOENT;
+	if (size > sizeof(u64))
+		return -E2BIG;
+
+	loc_param = btf_loc_param(param);
+	data = (const u32 *)(loc_param + 1);
+	flags = loc_param->flags;
+	vlen = btf_type_vlen(param);
+
+	if (flags & BTF_LOC_PARAM_CONST) {
+		if (flags & ~(BTF_LOC_PARAM_SIGNED | BTF_LOC_PARAM_CONST))
+			return -EOPNOTSUPP;
+		if (vlen != DIV_ROUND_UP(size, sizeof(u32)))
+			return -EINVAL;
+		for (i = 0; i < vlen; i++)
+			result |= (u64)data[i] << (i * 32);
+		if (flags & BTF_LOC_PARAM_SIGNED)
+			result = sign_extend64(result, size * 8 - 1);
+		*value = result;
+		return 0;
+	}
+
+	if (flags & BTF_LOC_PARAM_ADDR) {
+		if (flags != BTF_LOC_PARAM_ADDR || vlen != 1)
+			return -EOPNOTSUPP;
+		if (data[0] > ULONG_MAX - (unsigned long)_text)
+			return -EINVAL;
+		result = (unsigned long)_text + data[0];
+		*value = result;
+		return 0;
+	}
+
+	if (!(flags & BTF_LOC_PARAM_REG))
+		return -EOPNOTSUPP;
+
+	if (flags & BTF_LOC_PARAM_DEREF) {
+		if (flags & BTF_LOC_PARAM_OFFSET) {
+			if (vlen != 2)
+				return -EOPNOTSUPP;
+		} else if (vlen != 1) {
+			return -EOPNOTSUPP;
+		}
+
+		err = bpf_kprobe_multi_read_reg(regs, data[0], &reg_value);
+		if (err)
+			return err;
+		addr = reg_value;
+		if (flags & BTF_LOC_PARAM_OFFSET) {
+			offset = (s32)data[1];
+			if ((offset >= 0 && addr > ULONG_MAX - offset) ||
+			    (offset < 0 && addr < (unsigned long)-offset))
+				return -EFAULT;
+			addr += offset;
+		}
+		if (copy_from_kernel_nofault(&result, (void *)addr, size))
+			return -EFAULT;
+		if (flags & BTF_LOC_PARAM_SIGNED)
+			result = sign_extend64(result, size * 8 - 1);
+		*value = result;
+		return 0;
+	}
+
+	if (flags & BTF_LOC_PARAM_OFFSET)
+		return -EOPNOTSUPP;
+	if (!vlen || size % vlen)
+		return -EINVAL;
+	part_size = size / vlen;
+	if (part_size > sizeof(u64))
+		return -E2BIG;
+	for (i = 0; i < vlen; i++) {
+		err = bpf_kprobe_multi_read_reg(regs, data[i], &reg_value);
+		if (err)
+			return err;
+		memcpy((u8 *)&result + i * part_size, &reg_value, part_size);
+	}
+	if (flags & BTF_LOC_PARAM_SIGNED)
+		result = sign_extend64(result, size * 8 - 1);
+	*value = result;
+	return 0;
+}
+
+BPF_CALL_3(bpf_get_func_arg_kprobe_multi, void *, ctx, u32, n, u64 *, value)
+{
+	struct bpf_kprobe_multi_run_ctx *run_ctx;
+	const struct bpf_kprobe_multi_inline_info *info;
+	const struct btf_type *param;
+	const u32 *params;
+	u32 nr_args, param_id;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
+			       session_ctx.run_ctx);
+	info = bpf_kprobe_multi_inline_info_for_ip(run_ctx);
+	if (!info || !info->loc_proto)
+		return -EOPNOTSUPP;
+
+	nr_args = btf_type_vlen(info->loc_proto);
+	if (n >= nr_args)
+		return -EINVAL;
+	params = btf_loc_proto_params(info->loc_proto);
+	param_id = params[n];
+	if (!param_id)
+		return -ENOENT;
+	param = btf_type_by_id(info->btf, param_id);
+	if (!param || btf_kind(param) != BTF_KIND_LOC_PARAM)
+		return -EINVAL;
+
+	return bpf_kprobe_multi_eval_loc_param(param, (struct pt_regs *)ctx,
+					       value);
+}
+
+static const struct bpf_func_proto bpf_get_func_arg_proto_kprobe_multi = {
+	.func		= bpf_get_func_arg_kprobe_multi,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_WRITE | MEM_ALIGNED,
+	.arg3_size	= sizeof(u64),
+};
+
+BPF_CALL_1(bpf_get_func_arg_cnt_kprobe_multi, void *, ctx)
+{
+	struct bpf_kprobe_multi_run_ctx *run_ctx;
+	const struct bpf_kprobe_multi_inline_info *info;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
+			       session_ctx.run_ctx);
+	info = bpf_kprobe_multi_inline_info_for_ip(run_ctx);
+	if (!info || !info->loc_proto)
+		return 0;
+	return btf_type_vlen(info->loc_proto);
+}
+
+static const struct bpf_func_proto bpf_get_func_arg_cnt_proto_kprobe_multi = {
+	.func		= bpf_get_func_arg_cnt_kprobe_multi,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+};
 
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
@@ -3052,6 +3347,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	struct bpf_kprobe_multi_link *link = NULL;
 	struct bpf_link_primer link_primer;
 	struct bpf_kprobe_multi_addr *resolved = NULL;
+	struct bpf_kprobe_multi_inline_info *inline_info = NULL;
 	void __user *ucookies;
 	unsigned long *addrs = NULL, *fprobe_addrs = NULL;
 	unsigned long *inline_addrs = NULL;
@@ -3200,6 +3496,15 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 				else
 					fprobe_addrs[fprobe_idx++] = resolved[i].addr;
 			}
+			inline_info = kvmalloc_array(cnt, sizeof(*inline_info), GFP_KERNEL);
+			if (!inline_info) {
+				err = -ENOMEM;
+				goto error;
+			}
+			for (u32 i = 0; i < cnt; i++) {
+				inline_info[i].btf = resolved[i].btf;
+				inline_info[i].loc_proto = resolved[i].loc_proto;
+			}
 			kvfree(input_cookies);
 			input_cookies = NULL;
 			kvfree(resolved);
@@ -3240,6 +3545,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 	link->addrs = addrs;
 	link->cookies = cookies;
+	link->inline_info = inline_info;
 	link->cnt = cnt;
 	link->link.flags = flags;
 
@@ -3301,6 +3607,7 @@ error:
 	kvfree(resolved);
 	kvfree(fprobe_addrs);
 	kvfree(inline_addrs);
+	kvfree(inline_info);
 	return err;
 }
 #else /* !CONFIG_FPROBE */

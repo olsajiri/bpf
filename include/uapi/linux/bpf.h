@@ -5656,12 +5656,19 @@ union bpf_attr {
  *
  * long bpf_get_func_arg(void *ctx, u32 n, u64 *value)
  *	Description
- *		Get **n**-th argument register (zero based) of the traced function (for tracing programs)
- *		returned in **value**.
+ *		Get the **n**-th argument value (zero based) of the traced function
+ *		(for tracing programs)
+ *		returned in **value**. For kprobe multi programs attached with
+ *		**BPF_F_KPROBE_MULTI_INLINE**, inline function arguments are reconstructed
+ *		from the inline BTF location information.
  *
  *	Return
  *		0 on success.
- *		**-EINVAL** if n >= argument register count of traced function.
+ *		**-EINVAL** if n >= argument count of traced function.
+ *		**-ENOENT** if the argument has no location information.
+ *		**-EFAULT** if the argument cannot be safely read.
+ *		**-E2BIG** if the argument is wider than 64 bits.
+ *		**-EOPNOTSUPP** if the argument location is not supported.
  *
  * long bpf_get_func_ret(void *ctx, u64 *value)
  *	Description
@@ -5674,11 +5681,13 @@ union bpf_attr {
  *
  * long bpf_get_func_arg_cnt(void *ctx)
  *	Description
- *		Get number of registers of the traced function (for tracing programs) where
- *		function arguments are stored in these registers.
+ *		Get number of arguments of the traced function (for tracing programs).
+ *		For kprobe multi programs attached with **BPF_F_KPROBE_MULTI_INLINE**,
+ *		this is the number of logical arguments described by inline BTF.
  *
  *	Return
- *		The number of argument registers of the traced function.
+ *		The number of arguments of the traced function, or zero when no inline
+ *		location information is available for the current kprobe.
  *
  * int bpf_get_retval(void)
  *	Description
