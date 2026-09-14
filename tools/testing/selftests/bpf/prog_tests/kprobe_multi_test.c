@@ -320,7 +320,7 @@ static void test_attach_api_inline(void)
 
 			sym = symbols[i].name;
 			link = bpf_program__attach_kprobe_multi_opts(
-				skel->progs.test_kprobe_manual, NULL, &opts);
+				skel->progs.test_kprobe_inline, NULL, &opts);
 			if (IS_ERR(link)) {
 				link = NULL;
 				continue;
