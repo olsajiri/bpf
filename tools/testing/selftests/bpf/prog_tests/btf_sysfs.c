@@ -2,6 +2,7 @@
 /* Copyright (c) 2025 Isovalent */
 
 #include <test_progs.h>
+#include "testing_helpers.h"
 #include <bpf/btf.h>
 #include <dirent.h>
 #include <limits.h>
@@ -148,8 +149,75 @@ static void test_btf_inline_sysfs_all(void)
 	btf__free(vmlinux_btf);
 }
 
+static bool read_btf_sysfs(const char *path, void **data, size_t *size)
+{
+	struct stat st;
+	size_t off = 0;
+	ssize_t n;
+	int fd;
+
+	fd = open(path, O_RDONLY);
+	if (!ASSERT_GE(fd, 0, "open_btf_sysfs"))
+		return false;
+	if (!ASSERT_OK(fstat(fd, &st), "stat_btf_sysfs"))
+		goto err_close;
+	if (!ASSERT_GT(st.st_size, 0, "btf_sysfs_size"))
+		goto err_close;
+
+	*size = st.st_size;
+	*data = malloc(*size);
+	if (!ASSERT_OK_PTR(*data, "alloc_btf_sysfs"))
+		goto err_close;
+
+	while (off < *size) {
+		n = read(fd, *data + off, *size - off);
+		if (!ASSERT_GT(n, 0, "read_btf_sysfs")) {
+			free(*data);
+			*data = NULL;
+			goto err_close;
+		}
+		off += n;
+	}
+	close(fd);
+	return true;
+
+err_close:
+	close(fd);
+	return false;
+}
+
+static void test_btf_inline_sysfs_reload(void)
+{
+	const char *module_path = "/sys/module/btf_vmlinux_inline";
+	const char *inline_path = BTF_SYSFS_DIR "/vmlinux.inline";
+	struct stat st;
+	void *first = NULL, *second = NULL;
+	size_t first_size, second_size;
+
+	/* A built-in inline BTF representation has no carrier module to reload. */
+	if (stat(inline_path, &st))
+		return;
+
+	if (!read_btf_sysfs(inline_path, &first, &first_size))
+		return;
+	if (stat(module_path, &st))
+		goto out;
+	if (!ASSERT_OK(unload_module("btf_vmlinux_inline", false),
+		       "unload_btf_vmlinux_inline"))
+		goto out;
+	if (!read_btf_sysfs(inline_path, &second, &second_size))
+		goto out;
+
+	ASSERT_EQ(first_size, second_size, "reloaded_btf_size");
+	ASSERT_OK(memcmp(first, second, first_size), "reloaded_btf_data");
+out:
+	free(first);
+	free(second);
+}
+
 void test_btf_sysfs(void)
 {
 	test_btf_mmap_sysfs("/sys/kernel/btf/vmlinux", NULL);
 	test_btf_inline_sysfs_all();
+	test_btf_inline_sysfs_reload();
 }

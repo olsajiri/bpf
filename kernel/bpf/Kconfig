@@ -43,6 +43,16 @@ config BPF_SYSCALL
 	  Enable the bpf() system call that allows to manipulate BPF programs
 	  and maps via file descriptors.
 
+config BPF_KUNIT_TEST
+	tristate "BPF KUnit tests" if !KUNIT_ALL_TESTS
+	depends on BPF_SYSCALL && DEBUG_INFO_BTF_INLINE && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Enable KUnit tests for kernel-resident BPF BTF data. The tests verify
+	  that inline BTF is parsed as split BTF and is not exposed through the
+	  BTF IDR. The test suite is available only when inline BTF generation is
+	  enabled.
+
 config BPF_JIT
 	bool "Enable BPF Just In Time compiler"
 	depends on BPF
