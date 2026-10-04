@@ -3028,7 +3028,7 @@ BPF_CALL_3(bpf_get_func_arg_kprobe_multi, void *, ctx, u32, n, u64 *, value)
 	nr_args = btf_type_vlen(info->loc_proto);
 	if (n >= nr_args)
 		return -EINVAL;
-	params = btf_loc_params(info->loc_proto);
+	params = btf_loc_proto_params(info->loc_proto);
 	param_id = params[n];
 	if (!param_id)
 		return -ENOENT;
