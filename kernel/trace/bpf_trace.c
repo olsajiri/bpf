@@ -1349,6 +1349,16 @@ kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_get_stackid_proto;
 	case BPF_FUNC_get_stack:
 		return prog->sleepable ? &bpf_get_stack_sleepable_proto : &bpf_get_stack_proto;
+#ifdef CONFIG_FPROBE
+	case BPF_FUNC_get_func_arg:
+		if (is_kprobe_multi(prog))
+			return &bpf_get_func_arg_proto_kprobe_multi;
+		return NULL;
+	case BPF_FUNC_get_func_arg_cnt:
+		if (is_kprobe_multi(prog))
+			return &bpf_get_func_arg_cnt_proto_kprobe_multi;
+		return NULL;
+#endif
 #ifdef CONFIG_BPF_KPROBE_OVERRIDE
 	case BPF_FUNC_override_return:
 		return &bpf_override_return_proto;
