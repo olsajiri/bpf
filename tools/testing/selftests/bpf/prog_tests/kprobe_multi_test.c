@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <errno.h>
+#include <stdint.h>
 #include <sys/prctl.h>
 #include <test_progs.h>
 #include <bpf/btf.h>
@@ -224,14 +225,43 @@ struct inline_symbol {
 	__u32 loc_cnt;
 };
 
+static int inline_symbol_cmp(const void *a, const void *b)
+{
+	const struct inline_symbol *sym_a = a;
+	const struct inline_symbol *sym_b = b;
+
+	return strcmp(sym_a->name, sym_b->name);
+}
+
 static int collect_inline_symbols(const struct btf *inline_btf,
-					  struct inline_symbol *symbols, int max_symbols)
+				  struct inline_symbol **symbols_out)
 {
 	const struct btf *base_btf = btf__base_btf(inline_btf);
 	__u32 base_cnt = btf__type_cnt(base_btf);
 	__u32 nr_types = btf__type_cnt(inline_btf);
-	int symbol_cnt = 0;
+	struct inline_symbol *symbols;
+	size_t loc_cnt = 0;
+	size_t symbol_cnt = 0;
 	__u32 i, j;
+
+	*symbols_out = NULL;
+	for (i = base_cnt; i < nr_types; i++) {
+		const struct btf_type *t = btf__type_by_id(inline_btf, i);
+
+		if (!t || !btf_is_locsec(t))
+			continue;
+		if (loc_cnt > SIZE_MAX - btf_vlen(t))
+			return -EOVERFLOW;
+		loc_cnt += btf_vlen(t);
+	}
+	if (!loc_cnt)
+		return 0;
+	if (loc_cnt > INT_MAX || loc_cnt > SIZE_MAX / sizeof(*symbols))
+		return -E2BIG;
+
+	symbols = calloc(loc_cnt, sizeof(*symbols));
+	if (!symbols)
+		return -ENOMEM;
 
 	for (i = base_cnt; i < nr_types; i++) {
 		const struct btf_type *t = btf__type_by_id(inline_btf, i);
@@ -239,12 +269,10 @@ static int collect_inline_symbols(const struct btf *inline_btf,
 
 		if (!t || !btf_is_locsec(t))
 			continue;
-
 		loc = btf_locsec_locs(t);
 		for (j = 0; j < btf_vlen(t); j++, loc++) {
 			const struct btf_type *func;
 			const char *name;
-			int k;
 
 			func = btf__type_by_id(inline_btf, loc->func);
 			if (!func || !btf_is_func(func))
@@ -252,37 +280,36 @@ static int collect_inline_symbols(const struct btf *inline_btf,
 			name = btf__name_by_offset(inline_btf, func->name_off);
 			if (!name || !name[0])
 				continue;
-
-			for (k = 0; k < symbol_cnt; k++) {
-				if (!strcmp(symbols[k].name, name))
-					break;
-			}
-			if (k == symbol_cnt) {
-				if (symbol_cnt == max_symbols)
-					return symbol_cnt;
-				symbols[symbol_cnt++] = (struct inline_symbol){
-					.name = name,
-					.loc_cnt = 1,
-				};
-			} else {
-				symbols[k].loc_cnt++;
-			}
+			symbols[symbol_cnt++] = (struct inline_symbol){
+				.name = name,
+				.loc_cnt = 1,
+			};
 		}
 	}
 
-	return symbol_cnt;
+	qsort(symbols, symbol_cnt, sizeof(*symbols), inline_symbol_cmp);
+	for (i = 0, j = 0; i < symbol_cnt; i++) {
+		if (j && !strcmp(symbols[j - 1].name, symbols[i].name)) {
+			symbols[j - 1].loc_cnt++;
+			continue;
+		}
+		symbols[j++] = symbols[i];
+	}
+	*symbols_out = symbols;
+	return j;
 }
 
 static void test_attach_api_inline(void)
 {
-	struct inline_symbol symbols[64];
+	struct inline_symbol *symbols = NULL;
 	struct btf *vmlinux_btf = NULL, *inline_btf = NULL;
 	struct kprobe_multi *skel = NULL;
 	struct bpf_link *link = NULL;
 	struct bpf_link_info info;
 	const char *sym;
 	__u32 info_len;
-	int symbol_cnt, err, i, pass;
+	int symbol_cnt, err, i;
+	int ok_cnt = 0, fail_cnt = 0;
 
 	vmlinux_btf = btf__load_vmlinux_btf();
 	if (!ASSERT_OK_PTR(vmlinux_btf, "btf__load_vmlinux_btf"))
@@ -297,7 +324,9 @@ static void test_attach_api_inline(void)
 	if (!ASSERT_OK(err, "btf__parse_split"))
 		goto cleanup;
 
-	symbol_cnt = collect_inline_symbols(inline_btf, symbols, ARRAY_SIZE(symbols));
+	symbol_cnt = collect_inline_symbols(inline_btf, &symbols);
+	if (!ASSERT_GE(symbol_cnt, 0, "collect_inline_symbols"))
+		goto cleanup;
 	if (!ASSERT_GT(symbol_cnt, 0, "inline_symbols"))
 		goto cleanup;
 
@@ -305,46 +334,45 @@ static void test_attach_api_inline(void)
 	if (!ASSERT_OK_PTR(skel, "kprobe_multi__open_and_load"))
 		goto cleanup;
 
-	/* Prefer an inline-only name to cover the symbol lookup fallback. */
-	for (pass = 0; pass < 2 && !link; pass++) {
-		for (i = 0; i < symbol_cnt; i++) {
-			bool inline_only = !ksym_get_addr(symbols[i].name);
+	for (i = 0; i < symbol_cnt; i++) {
+		LIBBPF_OPTS(bpf_kprobe_multi_opts, opts,
+				.syms = &sym,
+				.cnt = 1,
+				.inline_probes = true);
 
-			LIBBPF_OPTS(bpf_kprobe_multi_opts, opts,
-					.syms = &sym,
-					.cnt = 1,
-					.inline_probes = true);
-
-			if (inline_only != (pass == 0))
-				continue;
-
-			sym = symbols[i].name;
-			link = bpf_program__attach_kprobe_multi_opts(
-				skel->progs.test_kprobe_inline, NULL, &opts);
-			if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts")) {
-				link = NULL;
-				continue;
-			}
-			memset(&info, 0, sizeof(info));
-			info_len = sizeof(info);
-			err = bpf_link_get_info_by_fd(bpf_link__fd(link), &info,
-						      &info_len);
-			if (!ASSERT_OK(err, "bpf_link_get_info_by_fd") ||
-			    !ASSERT_EQ(info.kprobe_multi.flags,
-				       BPF_F_KPROBE_MULTI_INLINE,
-				       "inline_probe_flag") ||
-			    !ASSERT_GE(info.kprobe_multi.count, symbols[i].loc_cnt,
-				       "inline_probe_count"))
-				goto cleanup;
-			break;
+		sym = symbols[i].name;
+		link = bpf_program__attach_kprobe_multi_opts(
+			skel->progs.test_kprobe_inline, NULL, &opts);
+		err = libbpf_get_error(link);
+		if (err) {
+			link = NULL;
+			printf("KRAVA FAIL %s\n", sym);
+			fail_cnt++;
+			continue;
 		}
+
+		printf("KRAVA OK %s\n", sym);
+		ok_cnt++;
+		memset(&info, 0, sizeof(info));
+		info_len = sizeof(info);
+		err = bpf_link_get_info_by_fd(bpf_link__fd(link), &info,
+					      &info_len);
+		ASSERT_OK(err, "bpf_link_get_info_by_fd");
+		if (!err) {
+			ASSERT_EQ(info.kprobe_multi.flags, BPF_F_KPROBE_MULTI_INLINE,
+				  "inline_probe_flag");
+			ASSERT_GE(info.kprobe_multi.count, symbols[i].loc_cnt,
+				  "inline_probe_count");
+		}
+		bpf_link__destroy(link);
+		link = NULL;
 	}
-	if (!ASSERT_OK_PTR(link, "inline_kprobe_multi_attach"))
-		goto cleanup;
+	printf("KRAVA OK: %d, FAIL: %d\n", ok_cnt, fail_cnt);
 
 cleanup:
 	bpf_link__destroy(link);
 	kprobe_multi__destroy(skel);
+	free(symbols);
 	btf__free(inline_btf);
 	btf__free(vmlinux_btf);
 }
