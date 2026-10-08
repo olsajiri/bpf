@@ -1519,8 +1519,10 @@ static kprobe_opcode_t *
 _kprobe_addr(kprobe_opcode_t *addr, const char *symbol_name,
 	     unsigned long offset, bool *on_func_entry)
 {
-	if ((symbol_name && addr) || (!symbol_name && !addr))
+	if ((symbol_name && addr) || (!symbol_name && !addr)) {
+		trace_printk("KRAVA _kprobe_addr1\n");
 		return ERR_PTR(-EINVAL);
+	}
 
 	if (symbol_name) {
 		/*
@@ -1550,8 +1552,10 @@ _kprobe_addr(kprobe_opcode_t *addr, const char *symbol_name,
 	 * at the start of the function.
 	 */
 	addr = arch_adjust_kprobe_addr((unsigned long)addr, offset, on_func_entry);
-	if (!addr)
+	if (!addr) {
+		trace_printk("KRAVA _kprobe_addr1\n");
 		return ERR_PTR(-EINVAL);
+	}
 
 	return addr;
 }
@@ -1726,13 +1730,17 @@ int register_kprobe(struct kprobe *p)
 
 	/* Canonicalize probe address from symbol */
 	addr = _kprobe_addr(p->addr, p->symbol_name, p->offset, &on_func_entry);
-	if (IS_ERR(addr))
+	if (IS_ERR(addr)) {
+		trace_printk("KRAVA register_kprobe1 err %ld\n", PTR_ERR(addr));
 		return PTR_ERR(addr);
+	}
 	p->addr = addr;
 
 	ret = warn_kprobe_rereg(p);
-	if (ret)
+	if (ret) {
+		trace_printk("KRAVA register_kprobe2 err %d\n", ret);
 		return ret;
+	}
 
 	/* User can pass only KPROBE_FLAG_DISABLED to register_kprobe */
 	p->flags &= KPROBE_FLAG_DISABLED;
@@ -1742,10 +1750,15 @@ int register_kprobe(struct kprobe *p)
 	INIT_LIST_HEAD(&p->list);
 
 	ret = check_kprobe_address_safe(p, &probed_mod);
-	if (ret)
+	if (ret) {
+		trace_printk("KRAVA register_kprobe3 err %d\n", ret);
 		return ret;
+	}
 
 	ret = __register_kprobe(p);
+
+	if (ret)
+		trace_printk("KRAVA register_kprobe4 err %d\n", ret);
 
 	if (probed_mod)
 		module_put(probed_mod);
@@ -1898,6 +1911,7 @@ int register_kprobes(struct kprobe **kps, int num)
 		return -EINVAL;
 	for (i = 0; i < num; i++) {
 		ret = register_kprobe(kps[i]);
+trace_printk("KRAVA KPROBE2 %lx err %d\n", (unsigned long) kps[i]->addr, ret);
 		if (ret < 0) {
 			if (i > 0)
 				unregister_kprobes(kps, i);

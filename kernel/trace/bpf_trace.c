@@ -2587,10 +2587,12 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 		return -ENOMEM;
 	}
 
+
 	for (i = 0; i < cnt; i++) {
 		unsigned long addr;
 
 		if (!ftrace_lookup_symbols(&syms[i], 1, &addr)) {
+trace_printk("KRAVA FPROBE %lx %s\n", addr, syms[i]);
 			addrs[*resolved_cnt].addr = addr;
 			addrs[*resolved_cnt].cookie = cookies ? cookies[i] : 0;
 			addrs[*resolved_cnt].name = syms[i];
@@ -2656,6 +2658,7 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 				goto out;
 			}
 			addr = base + loc->offset;
+trace_printk("KRAVA INLINE %lx %s\n", addr, name);
 			loc_proto = loc->loc_proto ?
 				btf_type_by_id(inline_btf, loc->loc_proto) : NULL;
 			err = bpf_kprobe_multi_add_inline_addr(&addrs, resolved_cnt,
