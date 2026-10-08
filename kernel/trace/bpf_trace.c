@@ -2568,8 +2568,13 @@ static int bpf_kprobe_multi_locsec_base(const char *name,
 static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 						   u32 cnt,
 						   struct bpf_kprobe_multi_addr **resolved,
-						   u32 *resolved_cnt)
+						   u32 *resolved_cnt,
+						   bool allow_partial)
 {
+	enum {
+		SYM_FOUND = 1,
+		SYM_HAS_ADDR = 2,
+	};
 	struct bpf_kprobe_multi_addr *addrs;
 	struct btf *inline_btf;
 	u8 *found;
@@ -2601,7 +2606,7 @@ trace_printk("KRAVA FPROBE %lx %s\n", addr, syms[i]);
 			addrs[*resolved_cnt].loc_proto_id = 0;
 			addrs[*resolved_cnt].inline_probe = false;
 			(*resolved_cnt)++;
-			found[i] = 1;
+			found[i] = SYM_FOUND | SYM_HAS_ADDR;
 		}
 	}
 
@@ -2620,12 +2625,16 @@ trace_printk("KRAVA FPROBE %lx %s\n", addr, syms[i]);
 		const char *sec_name;
 		unsigned long base;
 		struct btf_loc *loc;
+		bool skip_init;
 
 		if (!t || btf_kind(t) != BTF_KIND_LOCSEC)
 			continue;
 		sec_name = btf_name_by_offset(inline_btf, t->name_off);
 		if (!sec_name)
 			continue;
+		skip_init = !strcmp(sec_name, "inline.init.text") &&
+			    system_state >= SYSTEM_FREEING_INITMEM;
+
 		err = bpf_kprobe_multi_locsec_base(sec_name, &base);
 		if (err == -EOPNOTSUPP) {
 			err = 0;
@@ -2653,6 +2662,9 @@ trace_printk("KRAVA FPROBE %lx %s\n", addr, syms[i]);
 			if (!sym)
 				continue;
 			sym_idx = sym - syms;
+			found[sym_idx] |= SYM_FOUND;
+			if (skip_init)
+				continue;
 			if (loc->offset > ULONG_MAX - base) {
 				err = -EINVAL;
 				goto out;
@@ -2668,16 +2680,21 @@ trace_printk("KRAVA INLINE %lx %s\n", addr, name);
 							       loc->loc_proto);
 			if (err)
 				goto out;
-			found[sym_idx] = 2;
+			found[sym_idx] |= SYM_HAS_ADDR;
 		}
 	}
 
 check_found:
 	for (i = 0; i < cnt; i++) {
-		if (!found[i]) {
+		if (!(found[i] & SYM_FOUND) ||
+		    (!(found[i] & SYM_HAS_ADDR) && !allow_partial)) {
 			err = -ENOENT;
 			goto out;
 		}
+	}
+	if (!*resolved_cnt) {
+		err = -ENOENT;
+		goto out;
 	}
 
 	sort(addrs, *resolved_cnt, sizeof(*addrs), bpf_kprobe_multi_addr_cmp,
@@ -3407,7 +3424,11 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		return -EINVAL;
 
 	flags = attr->link_create.kprobe_multi.flags;
-	if (flags & ~(BPF_F_KPROBE_MULTI_RETURN | BPF_F_KPROBE_MULTI_INLINE))
+	if (flags & ~(BPF_F_KPROBE_MULTI_RETURN | BPF_F_KPROBE_MULTI_INLINE |
+		      BPF_F_KPROBE_MULTI_INLINE_ALLOW_PARTIAL))
+		return -EINVAL;
+	if ((flags & BPF_F_KPROBE_MULTI_INLINE_ALLOW_PARTIAL) &&
+	    !(flags & BPF_F_KPROBE_MULTI_INLINE))
 		return -EINVAL;
 	if ((flags & BPF_F_KPROBE_MULTI_INLINE) &&
 	    ((flags & BPF_F_KPROBE_MULTI_RETURN) || is_kprobe_session(prog) ||
@@ -3475,7 +3496,8 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 			input_cookies = cookies;
 			cookies = NULL;
 			err = bpf_kprobe_multi_resolve_inline(us.syms, input_cookies,
-							      cnt, &resolved, &resolved_cnt);
+							      cnt, &resolved, &resolved_cnt,
+							      flags & BPF_F_KPROBE_MULTI_INLINE_ALLOW_PARTIAL);
 			free_user_syms(&us);
 			if (err)
 				goto error;

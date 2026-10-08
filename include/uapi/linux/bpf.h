@@ -1356,7 +1356,9 @@ enum bpf_perf_event_type {
 enum {
 	BPF_F_KPROBE_MULTI_RETURN = (1U << 0),
 	/* Add probes to inline locations for the supplied symbols. */
-	BPF_F_KPROBE_MULTI_INLINE = (1U << 1)
+	BPF_F_KPROBE_MULTI_INLINE = (1U << 1),
+	/* Allow skipping inline symbols with no live sites, if any remain. */
+	BPF_F_KPROBE_MULTI_INLINE_ALLOW_PARTIAL = (1U << 2)
 };
 
 /* link_create.uprobe_multi.flags used in LINK_CREATE command for
