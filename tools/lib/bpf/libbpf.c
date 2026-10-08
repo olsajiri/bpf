@@ -13251,7 +13251,7 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	struct bpf_link *link = NULL;
 	const unsigned long *addrs;
 	int err, link_fd, prog_fd;
-	bool retprobe, session, unique_match, inline_probes;
+	bool retprobe, session, unique_match, inline_probes, allow_partial;
 	const __u64 *cookies;
 	const char **syms;
 	size_t cnt;
@@ -13272,6 +13272,7 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	cookies = OPTS_GET(opts, cookies, false);
 	unique_match = OPTS_GET(opts, unique_match, false);
 	inline_probes = OPTS_GET(opts, inline_probes, false);
+	allow_partial = OPTS_GET(opts, allow_partial, false);
 
 	if (!pattern && !addrs && !syms)
 		return libbpf_err_ptr(-EINVAL);
@@ -13284,6 +13285,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	if (addrs && syms)
 		return libbpf_err_ptr(-EINVAL);
 	if (inline_probes && addrs)
+		return libbpf_err_ptr(-EINVAL);
+	if (allow_partial && !inline_probes)
 		return libbpf_err_ptr(-EINVAL);
 
 	/*
@@ -13333,6 +13336,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	lopts.kprobe_multi.flags = retprobe ? BPF_F_KPROBE_MULTI_RETURN : 0;
 	if (inline_probes)
 		lopts.kprobe_multi.flags |= BPF_F_KPROBE_MULTI_INLINE;
+	if (allow_partial)
+		lopts.kprobe_multi.flags |= BPF_F_KPROBE_MULTI_INLINE_ALLOW_PARTIAL;
 
 	link = calloc(1, sizeof(*link));
 	if (!link) {

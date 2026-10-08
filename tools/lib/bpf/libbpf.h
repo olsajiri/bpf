@@ -633,10 +633,12 @@ struct bpf_kprobe_multi_opts {
 	bool unique_match;
 	/* include inline locations for the supplied symbols */
 	bool inline_probes;
+	/* allow skipping inline symbols with no live sites, if any remain */
+	bool allow_partial;
 	size_t :0;
 };
 
-#define bpf_kprobe_multi_opts__last_field inline_probes
+#define bpf_kprobe_multi_opts__last_field allow_partial
 
 LIBBPF_API struct bpf_link *
 bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
