@@ -2552,6 +2552,19 @@ static int bpf_kprobe_multi_add_inline_addr(struct bpf_kprobe_multi_addr **addrs
 	return 0;
 }
 
+static int bpf_kprobe_multi_locsec_base(const char *name,
+					unsigned long *base)
+{
+	if (!strcmp(name, "inline.text"))
+		*base = (unsigned long)_text;
+	else if (!strcmp(name, "inline.init.text"))
+		*base = (unsigned long)_sinittext;
+	else
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 						   u32 cnt,
 						   struct bpf_kprobe_multi_addr **resolved,
@@ -2602,10 +2615,22 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 	nr_types = btf_nr_types(inline_btf);
 	for (i = base_cnt; i < nr_types; i++) {
 		const struct btf_type *t = btf_type_by_id(inline_btf, i);
+		const char *sec_name;
+		unsigned long base;
 		struct btf_loc *loc;
 
 		if (!t || btf_kind(t) != BTF_KIND_LOCSEC)
 			continue;
+		sec_name = btf_name_by_offset(inline_btf, t->name_off);
+		if (!sec_name)
+			continue;
+		err = bpf_kprobe_multi_locsec_base(sec_name, &base);
+		if (err == -EOPNOTSUPP) {
+			err = 0;
+			continue;
+		}
+		if (err)
+			goto out;
 
 		for (j = 0, loc = btf_type_loc_secinfo(t);
 		     j < btf_type_vlen(t); j++, loc++) {
@@ -2626,11 +2651,11 @@ static int bpf_kprobe_multi_resolve_inline(const char **syms, u64 *cookies,
 			if (!sym)
 				continue;
 			sym_idx = sym - syms;
-			if (loc->offset > ULONG_MAX - (unsigned long)_text) {
+			if (loc->offset > ULONG_MAX - base) {
 				err = -EINVAL;
 				goto out;
 			}
-			addr = (unsigned long)_text + loc->offset;
+			addr = base + loc->offset;
 			loc_proto = loc->loc_proto ?
 				btf_type_by_id(inline_btf, loc->loc_proto) : NULL;
 			err = bpf_kprobe_multi_add_inline_addr(&addrs, resolved_cnt,
