@@ -74,7 +74,7 @@ struct btf_sysfs_entry {
 	char *module_name;
 };
 
-static void *btf_sysfs_lazy_data(const struct bin_attribute *attr)
+void *btf_sysfs_lazy_data(const struct bin_attribute *attr)
 {
 	struct btf_sysfs_entry *entry = container_of(attr, struct btf_sysfs_entry, attr);
 	void *data;
