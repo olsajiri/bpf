@@ -643,6 +643,7 @@ int btf_check_iter_arg(struct btf *btf, const struct btf_type *func, int arg_idx
 struct bin_attribute *sysfs_btf_add(const char *name, void *data, size_t data_size,
 				    bool mmap, const char *lazy_module_name);
 bool sysfs_btf_update(struct bin_attribute *attr, void *data);
+void *btf_sysfs_lazy_data(const struct bin_attribute *attr);
 void sysfs_btf_remove(struct bin_attribute *attr);
 #else
 static inline struct bin_attribute *
@@ -655,6 +656,11 @@ sysfs_btf_add(const char *name, void *data, size_t data_size, bool mmap,
 static inline bool sysfs_btf_update(struct bin_attribute *attr, void *data)
 {
 	return false;
+}
+
+static inline void *btf_sysfs_lazy_data(const struct bin_attribute *attr)
+{
+	return NULL;
 }
 
 static inline void sysfs_btf_remove(struct bin_attribute *attr)

@@ -6923,7 +6923,7 @@ __u32 btf_relocate_id(const struct btf *btf, __u32 id)
 	return btf->base_id_map[id];
 }
 
-#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES) || IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 
 static struct btf *btf_parse_split(struct btf_verifier_env *env,
 				   const char *name, const void *data,
@@ -6974,6 +6974,9 @@ errout:
 	return ERR_PTR(err);
 }
 
+#endif /* CONFIG_DEBUG_INFO_BTF_MODULES || CONFIG_DEBUG_INFO_BTF_INLINE */
+
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
 static int btf_rebase_inline(struct btf *inline_btf,
 			     const struct btf *module_btf,
 			     const u32 *module_id_map,
@@ -9229,7 +9232,8 @@ bool btf_is_kernel(const struct btf *btf)
 
 bool btf_is_module(const struct btf *btf)
 {
-	return btf->kernel_btf && strcmp(btf->name, "vmlinux") != 0;
+	return btf->kernel_btf && strcmp(btf->name, "vmlinux") != 0 &&
+		strcmp(btf->name, "vmlinux.inline") != 0;
 }
 
 enum {
@@ -9503,6 +9507,89 @@ static int __init btf_module_init(void)
 
 fs_initcall(btf_module_init);
 #endif /* CONFIG_DEBUG_INFO_BTF_MODULES */
+
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
+static struct btf *btf_vmlinux_inline;
+static DEFINE_MUTEX(btf_vmlinux_inline_lock);
+
+#if IS_BUILTIN(CONFIG_DEBUG_INFO_BTF_INLINE)
+extern char __start_BTF_inline[];
+extern char __stop_BTF_inline[];
+
+static const void *btf_vmlinux_inline_data(u32 *size)
+{
+	*size = __stop_BTF_inline - __start_BTF_inline;
+	return *size ? __start_BTF_inline : NULL;
+}
+#else
+static const void *btf_vmlinux_inline_data(u32 *size)
+{
+	const void *data;
+
+	if (!vmlinux_inline_attr)
+		return ERR_PTR(-ENODEV);
+	data = btf_sysfs_lazy_data(vmlinux_inline_attr);
+	if (!data)
+		return ERR_PTR(-ENODEV);
+	*size = vmlinux_inline_attr->size;
+	return data;
+}
+#endif
+
+static struct btf *btf_parse_vmlinux_inline(const void *data, u32 data_size)
+{
+	struct btf_verifier_env *env;
+	struct btf *vmlinux_btf, *btf;
+
+	vmlinux_btf = bpf_get_btf_vmlinux();
+	if (IS_ERR(vmlinux_btf))
+		return vmlinux_btf;
+	if (!vmlinux_btf)
+		return ERR_PTR(-EINVAL);
+
+	env = kzalloc_obj(*env, GFP_KERNEL | __GFP_NOWARN);
+	if (!env)
+		return ERR_PTR(-ENOMEM);
+
+	env->log.level = BPF_LOG_KERNEL;
+	btf = btf_parse_split(env, "vmlinux.inline", data,
+			      data_size, vmlinux_btf);
+	btf_verifier_env_free(env);
+	return btf;
+}
+
+struct btf *bpf_get_btf_vmlinux_inline(void)
+{
+	/* Pairs with the release publication after a successful parse below. */
+	struct btf *btf = smp_load_acquire(&btf_vmlinux_inline);
+	const void *data;
+	u32 data_size;
+
+	if (btf)
+		return btf;
+
+	data = btf_vmlinux_inline_data(&data_size);
+	if (IS_ERR_OR_NULL(data))
+		return ERR_CAST(data);
+
+	mutex_lock(&btf_vmlinux_inline_lock);
+	btf = btf_vmlinux_inline;
+	if (!btf) {
+		btf = btf_parse_vmlinux_inline(data, data_size);
+		if (!IS_ERR(btf)) {
+			/* Pairs with the acquire load on the cached path above. */
+			smp_store_release(&btf_vmlinux_inline, btf);
+		}
+	}
+	mutex_unlock(&btf_vmlinux_inline_lock);
+	return btf;
+}
+#else
+struct btf *bpf_get_btf_vmlinux_inline(void)
+{
+	return NULL;
+}
+#endif /* IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE) */
 
 struct module *btf_try_get_module(const struct btf *btf)
 {
