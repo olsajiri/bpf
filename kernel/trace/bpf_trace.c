@@ -22,6 +22,8 @@
 #include <linux/bsearch.h>
 #include <linux/sort.h>
 #include <linux/key.h>
+#include <linux/kallsyms.h>
+#include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/file.h>
 
@@ -30,6 +32,7 @@
 #include <uapi/linux/bpf.h>
 #include <uapi/linux/btf.h>
 
+#include <asm/sections.h>
 #include <asm/tlb.h>
 
 #include "trace_probe.h"
@@ -2333,15 +2336,34 @@ struct bpf_session_run_ctx {
 };
 
 #ifdef CONFIG_FPROBE
+struct bpf_kprobe_multi_link;
+
+struct bpf_kprobe_multi_kprobe {
+	struct kprobe kp;
+	struct bpf_kprobe_multi_link *link;
+};
+
+struct bpf_kprobe_multi_addr {
+	unsigned long addr;
+	u64 cookie;
+	bool inline_probe;
+};
+
 struct bpf_kprobe_multi_link {
 	struct bpf_link link;
 	struct fprobe fp;
 	unsigned long *addrs;
 	u64 *cookies;
+	struct bpf_kprobe_multi_kprobe *inline_probes;
+	struct kprobe **inline_kps;
 	u32 cnt;
+	u32 inline_cnt;
 	u32 mods_cnt;
 	struct module **mods;
+	bool fp_registered;
 };
+
+static void bpf_kprobe_multi_link_unregister(struct bpf_kprobe_multi_link *link);
 
 struct bpf_kprobe_multi_run_ctx {
 	struct bpf_session_run_ctx session_ctx;
@@ -2430,8 +2452,7 @@ static void bpf_kprobe_multi_link_release(struct bpf_link *link)
 	struct bpf_kprobe_multi_link *kmulti_link;
 
 	kmulti_link = container_of(link, struct bpf_kprobe_multi_link, link);
-	/* Don't wait for RCU GP here. */
-	unregister_fprobe_async(&kmulti_link->fp);
+	bpf_kprobe_multi_link_unregister(kmulti_link);
 	kprobe_multi_put_modules(kmulti_link->mods, kmulti_link->mods_cnt);
 }
 
@@ -2442,6 +2463,8 @@ static void bpf_kprobe_multi_link_dealloc(struct bpf_link *link)
 	kmulti_link = container_of(link, struct bpf_kprobe_multi_link, link);
 	kvfree(kmulti_link->addrs);
 	kvfree(kmulti_link->cookies);
+	kvfree(kmulti_link->inline_kps);
+	kvfree(kmulti_link->inline_probes);
 	kfree(kmulti_link->mods);
 	kfree(kmulti_link);
 }
@@ -2593,7 +2616,7 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
-			   unsigned long entry_ip, struct ftrace_regs *fregs,
+			   unsigned long entry_ip, struct pt_regs *regs,
 			   bool is_return, void *data)
 {
 	struct bpf_kprobe_multi_run_ctx run_ctx = {
@@ -2605,13 +2628,12 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 		.entry_ip = entry_ip,
 	};
 	struct bpf_run_ctx *old_run_ctx;
-	struct pt_regs *regs;
 	int err;
 
 	/*
-	 * graph tracer framework ensures we won't migrate, so there is no need
-	 * to use migrate_disable for bpf_prog_run again. The check here just for
-	 * __this_cpu_inc_return.
+	 * Probe callbacks keep execution on the current CPU, so there is no
+	 * need to use migrate_disable for bpf_prog_run again. The check here
+	 * is just for __this_cpu_inc_return.
 	 */
 	cant_sleep();
 
@@ -2622,16 +2644,93 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 	}
 
 	rcu_read_lock();
-	regs = ftrace_partial_regs(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	old_run_ctx = bpf_set_run_ctx(&run_ctx.session_ctx.run_ctx);
 	err = bpf_prog_run(link->link.prog, regs);
 	bpf_reset_run_ctx(old_run_ctx);
-	ftrace_partial_regs_update(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	rcu_read_unlock();
 
  out:
 	__this_cpu_dec(bpf_prog_active);
 	return err;
+}
+
+static __always_inline int
+kprobe_multi_link_prog_run_ftrace(struct bpf_kprobe_multi_link *link,
+				  unsigned long entry_ip, struct ftrace_regs *fregs,
+				  bool is_return, void *data)
+{
+	struct pt_regs *regs;
+	int err;
+
+	regs = ftrace_partial_regs(fregs, bpf_kprobe_multi_pt_regs_ptr());
+	err = kprobe_multi_link_prog_run(link, entry_ip, regs, is_return, data);
+	ftrace_partial_regs_update(fregs, bpf_kprobe_multi_pt_regs_ptr());
+	return err;
+}
+
+static int bpf_kprobe_multi_kprobe_pre_handler(struct kprobe *kp,
+					       struct pt_regs *regs)
+{
+	struct bpf_kprobe_multi_kprobe *probe;
+
+	probe = container_of(kp, struct bpf_kprobe_multi_kprobe, kp);
+	kprobe_multi_link_prog_run(probe->link, (unsigned long)kp->addr,
+				   regs, false, NULL);
+	return 0;
+}
+NOKPROBE_SYMBOL(bpf_kprobe_multi_kprobe_pre_handler);
+
+static int bpf_kprobe_multi_link_register_inline(struct bpf_kprobe_multi_link *link,
+						 unsigned long *addrs, u32 cnt)
+{
+	u32 i;
+	int err;
+
+	if (!cnt)
+		return 0;
+	if (!IS_ENABLED(CONFIG_KPROBES))
+		return -EOPNOTSUPP;
+
+	link->inline_probes = kvcalloc(cnt, sizeof(*link->inline_probes), GFP_KERNEL);
+	link->inline_kps = kvmalloc_array(cnt, sizeof(*link->inline_kps), GFP_KERNEL);
+	if (!link->inline_probes || !link->inline_kps) {
+		err = -ENOMEM;
+		goto err_free;
+	}
+
+	for (i = 0; i < cnt; i++) {
+		link->inline_probes[i].link = link;
+		link->inline_probes[i].kp.addr = (void *)addrs[i];
+		link->inline_probes[i].kp.pre_handler =
+			bpf_kprobe_multi_kprobe_pre_handler;
+		link->inline_kps[i] = &link->inline_probes[i].kp;
+	}
+
+	err = register_kprobes(link->inline_kps, cnt);
+	if (err)
+		goto err_free;
+	link->inline_cnt = cnt;
+	return 0;
+
+err_free:
+	kvfree(link->inline_kps);
+	kvfree(link->inline_probes);
+	link->inline_kps = NULL;
+	link->inline_probes = NULL;
+	return err;
+}
+
+static void bpf_kprobe_multi_link_unregister(struct bpf_kprobe_multi_link *link)
+{
+	if (link->fp_registered) {
+		/* Don't wait for RCU GP here. */
+		unregister_fprobe_async(&link->fp);
+		link->fp_registered = false;
+	}
+	if (link->inline_cnt) {
+		unregister_kprobes(link->inline_kps, link->inline_cnt);
+		link->inline_cnt = 0;
+	}
 }
 
 static int
@@ -2643,8 +2742,8 @@ kprobe_multi_link_handler(struct fprobe *fp, unsigned long fentry_ip,
 	int err;
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
-	err = kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
-					 fregs, false, data);
+	err = kprobe_multi_link_prog_run_ftrace(link, ftrace_get_entry_ip(fentry_ip),
+						fregs, false, data);
 	return is_kprobe_session(link->link.prog) ? err : 0;
 }
 
@@ -2656,8 +2755,8 @@ kprobe_multi_link_exit_handler(struct fprobe *fp, unsigned long fentry_ip,
 	struct bpf_kprobe_multi_link *link;
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
-	kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
-				   fregs, true, data);
+	kprobe_multi_link_prog_run_ftrace(link, ftrace_get_entry_ip(fentry_ip),
+					  fregs, true, data);
 }
 
 static int symbols_cmp_r(const void *a, const void *b, const void *priv)
@@ -2780,28 +2879,285 @@ static int addrs_check_error_injection_list(unsigned long *addrs, u32 cnt)
 struct kprobe_multi_resolved {
 	unsigned long *addrs;
 	u64 *cookies;
-	int cnt;
+	unsigned long *fprobe_addrs;
+	unsigned long *inline_addrs;
+	u32 cnt;
+	u32 fprobe_cnt;
+	u32 inline_cnt;
 };
 
 static void bpf_kprobe_multi_resolved_free(struct kprobe_multi_resolved *res)
 {
+	if (res->addrs != res->fprobe_addrs)
+		kvfree(res->fprobe_addrs);
 	kvfree(res->addrs);
 	kvfree(res->cookies);
+	kvfree(res->inline_addrs);
+	*res = (struct kprobe_multi_resolved){};
+}
+
+struct kprobe_multi_resolve_ctx {
+	const char **syms;
+	const u64 *cookies;
+	struct bpf_kprobe_multi_addr *addrs;
+	u8 *found;
+	u32 cnt;
+	u32 addr_cnt;
+};
+
+static int symbols_cmp(const void *a, const void *b)
+{
+	return symbols_cmp_r(a, b, NULL);
+}
+
+static int bpf_kprobe_multi_resolve_cb(void *data, const char *name,
+				       unsigned long addr)
+{
+	struct kprobe_multi_resolve_ctx *ctx = data;
+	const char **sym;
+	u32 i;
+
+	sym = bsearch(&name, ctx->syms, ctx->cnt, sizeof(*ctx->syms), symbols_cmp);
+	if (!sym)
+		return 0;
+	i = sym - ctx->syms;
+	while (i && !strcmp(ctx->syms[i - 1], name))
+		i--;
+	if (ctx->found[i] || !ftrace_location(addr))
+		return 0;
+
+	for (; i < ctx->cnt && !strcmp(ctx->syms[i], name); i++) {
+		ctx->addrs[ctx->addr_cnt++] = (struct bpf_kprobe_multi_addr){
+			.addr = addr,
+			.cookie = ctx->cookies ? ctx->cookies[i] : 0,
+		};
+		ctx->found[i] = 1;
+	}
+	return ctx->addr_cnt == ctx->cnt;
+}
+
+static int bpf_kprobe_multi_addr_cmp(const void *a, const void *b)
+{
+	const struct bpf_kprobe_multi_addr *addr_a = a, *addr_b = b;
+
+	if (addr_a->addr != addr_b->addr)
+		return addr_a->addr < addr_b->addr ? -1 : 1;
+	/* Keep the fprobe entry when an inline location shares its address. */
+	return (int)addr_a->inline_probe - (int)addr_b->inline_probe;
+}
+
+static int bpf_kprobe_multi_add_inline_addr(struct kprobe_multi_resolve_ctx *ctx,
+					    u32 *cap, unsigned long addr, u64 cookie)
+{
+	struct bpf_kprobe_multi_addr *addrs;
+	u32 new_cap;
+
+	if (ctx->addr_cnt == MAX_KPROBE_MULTI_CNT)
+		return -E2BIG;
+	if (ctx->addr_cnt == *cap) {
+		new_cap = min_t(u32, MAX_KPROBE_MULTI_CNT,
+				max_t(u32, 16, *cap * 3 / 2));
+		addrs = kvrealloc(ctx->addrs, array_size(new_cap, sizeof(*addrs)),
+				  GFP_KERNEL);
+		if (!addrs)
+			return -ENOMEM;
+		ctx->addrs = addrs;
+		*cap = new_cap;
+	}
+	ctx->addrs[ctx->addr_cnt++] = (struct bpf_kprobe_multi_addr){
+		.addr = addr,
+		.cookie = cookie,
+		.inline_probe = true,
+	};
+	return 0;
 }
 
 static int
-bpf_kprobe_multi_resolve(const char **sorted_syms, size_t cnt,
+bpf_kprobe_multi_resolve_inline(const char **sorted_syms, size_t cnt,
+				struct kprobe_multi_resolved *res)
+{
+	struct kprobe_multi_resolved resolved = {};
+	struct kprobe_multi_resolve_ctx ctx = {
+		.syms = sorted_syms,
+		.cookies = res->cookies,
+		.cnt = cnt,
+	};
+	struct btf *inline_btf;
+	u32 i, j, cap = cnt, fprobe_idx = 0, inline_idx = 0;
+	int err;
+
+	ctx.addrs = kvmalloc_array(cap, sizeof(*ctx.addrs), GFP_KERNEL);
+	ctx.found = kcalloc(cnt, sizeof(*ctx.found), GFP_KERNEL);
+	if (!ctx.addrs || !ctx.found) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	if (cnt == 1) {
+		unsigned long addr;
+
+		if (!ftrace_lookup_symbols(sorted_syms, 1, &addr))
+			bpf_kprobe_multi_resolve_cb(&ctx, sorted_syms[0], addr);
+	} else {
+		err = kallsyms_on_each_symbol(bpf_kprobe_multi_resolve_cb, &ctx);
+		if (err < 0 && err != -EOPNOTSUPP)
+			goto out;
+		if (ctx.addr_cnt < cnt && IS_ENABLED(CONFIG_MODULES)) {
+			err = module_kallsyms_on_each_symbol(NULL, bpf_kprobe_multi_resolve_cb,
+							     &ctx);
+			if (err < 0 && err != -EOPNOTSUPP)
+				goto out;
+		}
+	}
+
+	inline_btf = bpf_get_btf_vmlinux_inline();
+	if (IS_ERR(inline_btf)) {
+		err = PTR_ERR(inline_btf);
+		goto out;
+	}
+	if (inline_btf) {
+		u32 base_cnt = btf_nr_types(btf_base_btf(inline_btf));
+		u32 nr_types = btf_nr_types(inline_btf);
+
+		for (i = base_cnt; i < nr_types; i++) {
+			const struct btf_type *t = btf_type_by_id(inline_btf, i);
+			const char *sec_name;
+			unsigned long base;
+			struct btf_loc *loc;
+
+			if (!t || btf_kind(t) != BTF_KIND_LOCSEC)
+				continue;
+			sec_name = btf_name_by_offset(inline_btf, t->name_off);
+			if (!sec_name)
+				continue;
+			if (!strcmp(sec_name, "inline.text")) {
+				base = (unsigned long)_text;
+			} else if (!strcmp(sec_name, "inline.init.text") &&
+				   system_state < SYSTEM_FREEING_INITMEM) {
+				base = (unsigned long)_sinittext;
+			} else {
+				continue;
+			}
+
+			for (j = 0, loc = btf_type_loc_secinfo(t);
+			     j < btf_type_vlen(t); j++, loc++) {
+				const struct btf_type *func;
+				const char *name;
+				const char **sym;
+				unsigned long addr;
+				u32 sym_idx;
+
+				func = btf_type_by_id(inline_btf, loc->func);
+				if (!func || btf_kind(func) != BTF_KIND_FUNC)
+					continue;
+				name = btf_name_by_offset(inline_btf, func->name_off);
+				if (!name)
+					continue;
+				sym = bsearch(&name, sorted_syms, cnt, sizeof(*sorted_syms),
+					      symbols_cmp);
+				if (!sym)
+					continue;
+				sym_idx = sym - sorted_syms;
+				if (loc->offset > ULONG_MAX - base) {
+					err = -EINVAL;
+					goto out;
+				}
+				addr = base + loc->offset;
+				while (sym_idx && !strcmp(sorted_syms[sym_idx - 1], name))
+					sym_idx--;
+				for (; sym_idx < cnt && !strcmp(sorted_syms[sym_idx], name);
+				     sym_idx++) {
+					u64 cookie = res->cookies ? res->cookies[sym_idx] : 0;
+
+					err = bpf_kprobe_multi_add_inline_addr(&ctx, &cap,
+									       addr, cookie);
+					if (err)
+						goto out;
+					ctx.found[sym_idx] = 1;
+				}
+			}
+		}
+	}
+
+	for (i = 0; i < cnt; i++) {
+		if (!ctx.found[i]) {
+			err = -ENOENT;
+			goto out;
+		}
+	}
+	if (!ctx.addr_cnt) {
+		err = -ENOENT;
+		goto out;
+	}
+	sort(ctx.addrs, ctx.addr_cnt, sizeof(*ctx.addrs), bpf_kprobe_multi_addr_cmp, NULL);
+	for (i = 0, j = 0; i < ctx.addr_cnt; i++) {
+		if (j && ctx.addrs[i].addr == ctx.addrs[j - 1].addr)
+			continue;
+		ctx.addrs[j++] = ctx.addrs[i];
+	}
+	resolved.cnt = j;
+	for (i = 0; i < resolved.cnt; i++) {
+		if (ctx.addrs[i].inline_probe)
+			resolved.inline_cnt++;
+		else
+			resolved.fprobe_cnt++;
+	}
+	resolved.addrs = kvmalloc_array(resolved.cnt, sizeof(*resolved.addrs), GFP_KERNEL);
+	if (res->cookies)
+		resolved.cookies = kvmalloc_array(resolved.cnt, sizeof(*resolved.cookies),
+						  GFP_KERNEL);
+	if (resolved.fprobe_cnt)
+		resolved.fprobe_addrs = kvmalloc_array(resolved.fprobe_cnt,
+						       sizeof(*resolved.fprobe_addrs), GFP_KERNEL);
+	if (resolved.inline_cnt)
+		resolved.inline_addrs = kvmalloc_array(resolved.inline_cnt,
+						       sizeof(*resolved.inline_addrs), GFP_KERNEL);
+	if (!resolved.addrs || (res->cookies && !resolved.cookies) ||
+	    (resolved.fprobe_cnt && !resolved.fprobe_addrs) ||
+	    (resolved.inline_cnt && !resolved.inline_addrs)) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < resolved.cnt; i++) {
+		resolved.addrs[i] = ctx.addrs[i].addr;
+		if (resolved.cookies)
+			resolved.cookies[i] = ctx.addrs[i].cookie;
+		if (ctx.addrs[i].inline_probe)
+			resolved.inline_addrs[inline_idx++] = ctx.addrs[i].addr;
+		else
+			resolved.fprobe_addrs[fprobe_idx++] = ctx.addrs[i].addr;
+	}
+	kvfree(res->cookies);
+	*res = resolved;
+	resolved = (struct kprobe_multi_resolved){};
+	err = 0;
+out:
+	bpf_kprobe_multi_resolved_free(&resolved);
+	kvfree(ctx.found);
+	kvfree(ctx.addrs);
+	return err;
+}
+
+static int
+bpf_kprobe_multi_resolve(const char **sorted_syms, size_t cnt, bool has_inline,
 			 struct kprobe_multi_resolved *res)
 {
 	int err;
+
+	if (has_inline)
+		return bpf_kprobe_multi_resolve_inline(sorted_syms, cnt, res);
 
 	res->addrs = kvmalloc_array(cnt, sizeof(*res->addrs), GFP_KERNEL);
 	if (!res->addrs)
 		return -ENOMEM;
 	err = ftrace_lookup_symbols(sorted_syms, cnt, res->addrs);
-	if (!err)
+	if (!err) {
 		res->cnt = cnt;
+		res->fprobe_cnt = cnt;
+		res->fprobe_addrs = res->addrs;
+	}
 	return err;
+
 }
 
 int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
@@ -2813,6 +3169,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	u32 flags, cnt, size;
 	void __user *uaddrs;
 	void __user *usyms;
+	bool has_inline;
 	int err;
 
 	/* no support for 32bit archs yet */
@@ -2834,12 +3191,19 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		return -EINVAL;
 
 	flags = attr->link_create.kprobe_multi.flags;
-	if (flags & ~BPF_F_KPROBE_MULTI_RETURN)
+	if (flags & ~(BPF_F_KPROBE_MULTI_RETURN | BPF_F_KPROBE_MULTI_INLINE))
+		return -EINVAL;
+	has_inline = flags & BPF_F_KPROBE_MULTI_INLINE;
+	if (has_inline &&
+	    ((flags & BPF_F_KPROBE_MULTI_RETURN) || is_kprobe_session(prog) ||
+	     prog->kprobe_override))
 		return -EINVAL;
 
 	uaddrs = u64_to_user_ptr(attr->link_create.kprobe_multi.addrs);
 	usyms = u64_to_user_ptr(attr->link_create.kprobe_multi.syms);
 	if (!!uaddrs == !!usyms)
+		return -EINVAL;
+	if (has_inline && uaddrs)
 		return -EINVAL;
 
 	cnt = attr->link_create.kprobe_multi.cnt;
@@ -2865,15 +3229,17 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 	if (uaddrs) {
 		res.addrs = kvmalloc_array(cnt, sizeof(*res.addrs), GFP_KERNEL);
-		if (!res.addrs)  {
+		if (!res.addrs) {
 			err = -ENOMEM;
 			goto error;
 		}
+		res.fprobe_addrs = res.addrs;
 		if (copy_from_user(res.addrs, uaddrs, size)) {
 			err = -EFAULT;
 			goto error;
 		}
 		res.cnt = cnt;
+		res.fprobe_cnt = cnt;
 	} else {
 		struct multi_symbols_sort data = {
 			.cookies = res.cookies,
@@ -2890,7 +3256,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		sort_r(us.syms, cnt, sizeof(*us.syms), symbols_cmp_r,
 		       symbols_swap_r, &data);
 
-		err = bpf_kprobe_multi_resolve(us.syms, cnt, &res);
+		err = bpf_kprobe_multi_resolve(us.syms, cnt, has_inline, &res);
 		free_user_syms(&us);
 		if (err)
 			goto error;
@@ -2926,39 +3292,56 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	link->cnt = res.cnt;
 	link->link.flags = flags;
 
-	/* Link owns addrs and cookie arrays from here on. */
-	res.addrs = NULL;
-	res.cookies = NULL;
-
-	if (link.cookies) {
+	if (link->cookies && !has_inline) {
 		/*
 		 * Sorting addresses will trigger sorting cookies as well
 		 * (check bpf_kprobe_multi_cookie_swap). This way we can
 		 * find cookie based on the address in bpf_get_attach_cookie
 		 * helper.
 		 */
-		sort_r(link.addrs, link.cnt, sizeof(*link.addrs),
+		sort_r(link->addrs, link->cnt, sizeof(*link->addrs),
 		       bpf_kprobe_multi_cookie_cmp,
 		       bpf_kprobe_multi_cookie_swap,
 		       link);
 	}
 
 	err = get_modules_for_addrs(&link->mods, link->addrs, link->cnt);
-	if (err < 0) {
-		bpf_link_cleanup(&link_primer);
-		return err;
-	}
+	if (err < 0)
+		goto cleanup;
 	link->mods_cnt = err;
 
-	err = register_fprobe_ips(&link->fp, link->addrs, link->cnt);
+	if (res.fprobe_cnt) {
+		err = register_fprobe_ips(&link->fp, res.fprobe_addrs, res.fprobe_cnt);
+		if (err)
+			goto error_modules;
+		link->fp_registered = true;
+	}
+
+	if (res.inline_cnt) {
+		err = bpf_kprobe_multi_link_register_inline(link, res.inline_addrs, res.inline_cnt);
+		if (err) {
+			bpf_kprobe_multi_link_unregister(link);
+			goto error_modules;
+		}
+	}
+
+	err = 0;
+	goto cleanup;
+
+error_modules:
+	kprobe_multi_put_modules(link->mods, link->mods_cnt);
+cleanup:
+	/* The link owns the merged arrays, including any fprobe alias. */
+	if (res.fprobe_addrs == res.addrs)
+		res.fprobe_addrs = NULL;
+	res.addrs = NULL;
+	res.cookies = NULL;
+	bpf_kprobe_multi_resolved_free(&res);
 	if (err) {
-		kprobe_multi_put_modules(link->mods, link->mods_cnt);
 		bpf_link_cleanup(&link_primer);
 		return err;
 	}
-
 	return bpf_link_settle(&link_primer);
-
 error:
 	kfree(link);
 	bpf_kprobe_multi_resolved_free(&res);
