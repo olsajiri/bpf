@@ -682,6 +682,14 @@ static void *bpf_test_init(const union bpf_attr *kattr, u32 user_size,
 	return data;
 }
 
+static __always_inline unsigned long bpf_fentry_test_inline(unsigned long arg)
+{
+	/* Volatile access keeps an instruction at each inline site. */
+	volatile unsigned long value = arg;
+
+	return value;
+}
+
 int bpf_prog_test_run_tracing(struct bpf_prog *prog,
 			      const union bpf_attr *kattr,
 			      union bpf_attr __user *uattr)
@@ -710,7 +718,10 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
 		    bpf_fentry_test7((struct bpf_fentry_test_t *)0) != 0 ||
 		    bpf_fentry_test8(&arg) != 0 ||
 		    bpf_fentry_test9(&retval) != 0 ||
-		    bpf_fentry_test10((void *)0) != 0)
+		    bpf_fentry_test10((void *)0) != 0 ||
+		    bpf_fentry_test_inline(0x11) != 0x11 ||
+		    bpf_fentry_test_inline(0x22) != 0x22 ||
+		    bpf_fentry_test_inline(0x33) != 0x33)
 			goto out;
 		break;
 	case BPF_MODIFY_RETURN:
