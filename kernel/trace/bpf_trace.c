@@ -2777,15 +2777,41 @@ static int addrs_check_error_injection_list(unsigned long *addrs, u32 cnt)
 	return 0;
 }
 
+struct kprobe_multi_resolved {
+	unsigned long *addrs;
+	u64 *cookies;
+	u32 cnt;
+};
+
+static void bpf_kprobe_multi_resolved_free(struct kprobe_multi_resolved *res)
+{
+	kvfree(res->addrs);
+	kvfree(res->cookies);
+}
+
+static int
+bpf_kprobe_multi_resolve(const char **sorted_syms, u32 cnt,
+			 struct kprobe_multi_resolved *res)
+{
+	int err;
+
+	res->addrs = kvmalloc_array(cnt, sizeof(*res->addrs), GFP_KERNEL);
+	if (!res->addrs)
+		return -ENOMEM;
+	err = ftrace_lookup_symbols(sorted_syms, cnt, res->addrs);
+	if (!err)
+		res->cnt = cnt;
+	return err;
+}
+
 int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 {
 	struct bpf_kprobe_multi_link *link = NULL;
+	struct kprobe_multi_resolved res = {};
 	struct bpf_link_primer link_primer;
 	void __user *ucookies;
-	unsigned long *addrs;
 	u32 flags, cnt, size;
 	void __user *uaddrs;
-	u64 *cookies = NULL;
 	void __user *usyms;
 	int err;
 
@@ -2822,32 +2848,35 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	if (cnt > MAX_KPROBE_MULTI_CNT)
 		return -E2BIG;
 
-	size = cnt * sizeof(*addrs);
-	addrs = kvmalloc_array(cnt, sizeof(*addrs), GFP_KERNEL);
-	if (!addrs)
-		return -ENOMEM;
+	size = cnt * sizeof(*res.addrs);
 
 	ucookies = u64_to_user_ptr(attr->link_create.kprobe_multi.cookies);
 	if (ucookies) {
-		cookies = kvmalloc_array(cnt, sizeof(*addrs), GFP_KERNEL);
-		if (!cookies) {
+		res.cookies = kvmalloc_array(cnt, sizeof(*res.cookies), GFP_KERNEL);
+		if (!res.cookies) {
 			err = -ENOMEM;
 			goto error;
 		}
-		if (copy_from_user(cookies, ucookies, size)) {
+		if (copy_from_user(res.cookies, ucookies, size)) {
 			err = -EFAULT;
 			goto error;
 		}
 	}
 
 	if (uaddrs) {
-		if (copy_from_user(addrs, uaddrs, size)) {
+		res.addrs = kvmalloc_array(cnt, sizeof(*res.addrs), GFP_KERNEL);
+		if (!res.addrs)  {
+			err = -ENOMEM;
+			goto error;
+		}
+		if (copy_from_user(res.addrs, uaddrs, size)) {
 			err = -EFAULT;
 			goto error;
 		}
+		res.cnt = cnt;
 	} else {
 		struct multi_symbols_sort data = {
-			.cookies = cookies,
+			.cookies = res.cookies,
 		};
 		struct user_syms us;
 
@@ -2855,19 +2884,19 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		if (err)
 			goto error;
 
-		if (cookies)
+		if (res.cookies)
 			data.funcs = us.syms;
 
 		sort_r(us.syms, cnt, sizeof(*us.syms), symbols_cmp_r,
 		       symbols_swap_r, &data);
 
-		err = ftrace_lookup_symbols(us.syms, cnt, addrs);
+		err = bpf_kprobe_multi_resolve(us.syms, cnt, &res);
 		free_user_syms(&us);
 		if (err)
 			goto error;
 	}
 
-	if (prog->kprobe_override && addrs_check_error_injection_list(addrs, cnt)) {
+	if (prog->kprobe_override && addrs_check_error_injection_list(res.addrs, res.cnt)) {
 		err = -EINVAL;
 		goto error;
 	}
@@ -2892,32 +2921,36 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	if (is_kprobe_session(prog))
 		link->fp.entry_data_size = sizeof(u64);
 
-	link->addrs = addrs;
-	link->cookies = cookies;
-	link->cnt = cnt;
+	link->addrs = res.addrs;
+	link->cookies = res.cookies;
+	link->cnt = res.cnt;
 	link->link.flags = flags;
 
-	if (cookies) {
+	/* Link owns addrs and cookie arrays from here on. */
+	res.addrs = NULL;
+	res.cookies = NULL;
+
+	if (link.cookies) {
 		/*
 		 * Sorting addresses will trigger sorting cookies as well
 		 * (check bpf_kprobe_multi_cookie_swap). This way we can
 		 * find cookie based on the address in bpf_get_attach_cookie
 		 * helper.
 		 */
-		sort_r(addrs, cnt, sizeof(*addrs),
+		sort_r(link.addrs, link.cnt, sizeof(*link.addrs),
 		       bpf_kprobe_multi_cookie_cmp,
 		       bpf_kprobe_multi_cookie_swap,
 		       link);
 	}
 
-	err = get_modules_for_addrs(&link->mods, addrs, cnt);
+	err = get_modules_for_addrs(&link->mods, link->addrs, link->cnt);
 	if (err < 0) {
 		bpf_link_cleanup(&link_primer);
 		return err;
 	}
 	link->mods_cnt = err;
 
-	err = register_fprobe_ips(&link->fp, addrs, cnt);
+	err = register_fprobe_ips(&link->fp, link->addrs, link->cnt);
 	if (err) {
 		kprobe_multi_put_modules(link->mods, link->mods_cnt);
 		bpf_link_cleanup(&link_primer);
@@ -2928,8 +2961,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 error:
 	kfree(link);
-	kvfree(addrs);
-	kvfree(cookies);
+	bpf_kprobe_multi_resolved_free(&res);
 	return err;
 }
 #else /* !CONFIG_FPROBE */
