@@ -631,10 +631,12 @@ struct bpf_kprobe_multi_opts {
 	bool session;
 	/* enforce unique match */
 	bool unique_match;
+	/* include inline locations for the supplied symbols */
+	bool inline_probes;
 	size_t :0;
 };
 
-#define bpf_kprobe_multi_opts__last_field unique_match
+#define bpf_kprobe_multi_opts__last_field inline_probes
 
 LIBBPF_API struct bpf_link *
 bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
