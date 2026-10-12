@@ -13151,7 +13151,7 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	struct bpf_link *link = NULL;
 	const unsigned long *addrs;
 	int err, link_fd, prog_fd;
-	bool retprobe, session, unique_match;
+	bool retprobe, session, unique_match, inline_probes;
 	const __u64 *cookies;
 	const char **syms;
 	size_t cnt;
@@ -13171,6 +13171,7 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	cnt     = OPTS_GET(opts, cnt, false);
 	cookies = OPTS_GET(opts, cookies, false);
 	unique_match = OPTS_GET(opts, unique_match, false);
+	inline_probes = OPTS_GET(opts, inline_probes, false);
 
 	if (!pattern && !addrs && !syms)
 		return libbpf_err_ptr(-EINVAL);
@@ -13181,6 +13182,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	if (!pattern && unique_match)
 		return libbpf_err_ptr(-EINVAL);
 	if (addrs && syms)
+		return libbpf_err_ptr(-EINVAL);
+	if (inline_probes && addrs)
 		return libbpf_err_ptr(-EINVAL);
 
 	/*
@@ -13193,6 +13196,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 		syms = &pattern;
 		cnt = 1;
 	} else if (pattern) {
+		if (inline_probes)
+			return libbpf_err_ptr(-EINVAL);
 		if (has_available_filter_functions_addrs())
 			err = libbpf_available_kprobes_parse(&res);
 		else
@@ -13216,6 +13221,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 
 	if (retprobe && session)
 		return libbpf_err_ptr(-EINVAL);
+	if (inline_probes && (retprobe || session))
+		return libbpf_err_ptr(-EINVAL);
 
 	attach_type = session ? BPF_TRACE_KPROBE_SESSION : BPF_TRACE_KPROBE_MULTI;
 
@@ -13224,6 +13231,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	lopts.kprobe_multi.cookies = cookies;
 	lopts.kprobe_multi.cnt = cnt;
 	lopts.kprobe_multi.flags = retprobe ? BPF_F_KPROBE_MULTI_RETURN : 0;
+	if (inline_probes)
+		lopts.kprobe_multi.flags |= BPF_F_KPROBE_MULTI_INLINE;
 
 	link = calloc(1, sizeof(*link));
 	if (!link) {
