@@ -2893,7 +2893,6 @@ static void bpf_kprobe_multi_resolved_free(struct kprobe_multi_resolved *res)
 	kvfree(res->addrs);
 	kvfree(res->cookies);
 	kvfree(res->inline_addrs);
-	*res = (struct kprobe_multi_resolved){};
 }
 
 struct kprobe_multi_resolve_ctx {
@@ -3292,6 +3291,10 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	link->cnt = res.cnt;
 	link->link.flags = flags;
 
+	/* Link owns addrs and cookie arrays from here on. */
+	res.addrs = NULL;
+	res.cookies = NULL;
+
 	if (link->cookies && !has_inline) {
 		/*
 		 * Sorting addresses will trigger sorting cookies as well
@@ -3307,7 +3310,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 	err = get_modules_for_addrs(&link->mods, link->addrs, link->cnt);
 	if (err < 0)
-		goto cleanup;
+		goto error_cleanup;
 	link->mods_cnt = err;
 
 	if (res.fprobe_cnt) {
@@ -3325,23 +3328,16 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		}
 	}
 
-	err = 0;
-	goto cleanup;
+	bpf_kprobe_multi_resolved_free(&res);
+	return bpf_link_settle(&link_primer);
 
 error_modules:
 	kprobe_multi_put_modules(link->mods, link->mods_cnt);
-cleanup:
-	/* The link owns the merged arrays, including any fprobe alias. */
-	if (res.fprobe_addrs == res.addrs)
-		res.fprobe_addrs = NULL;
-	res.addrs = NULL;
-	res.cookies = NULL;
+error_cleanup:
 	bpf_kprobe_multi_resolved_free(&res);
-	if (err) {
-		bpf_link_cleanup(&link_primer);
-		return err;
-	}
-	return bpf_link_settle(&link_primer);
+	bpf_link_cleanup(&link_primer);
+	return err;
+
 error:
 	kfree(link);
 	bpf_kprobe_multi_resolved_free(&res);
