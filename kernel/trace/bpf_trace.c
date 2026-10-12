@@ -2593,7 +2593,7 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
-			   unsigned long entry_ip, struct ftrace_regs *fregs,
+			   unsigned long entry_ip, struct pt_regs *regs,
 			   bool is_return, void *data)
 {
 	struct bpf_kprobe_multi_run_ctx run_ctx = {
@@ -2605,13 +2605,12 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 		.entry_ip = entry_ip,
 	};
 	struct bpf_run_ctx *old_run_ctx;
-	struct pt_regs *regs;
 	int err;
 
 	/*
-	 * graph tracer framework ensures we won't migrate, so there is no need
-	 * to use migrate_disable for bpf_prog_run again. The check here just for
-	 * __this_cpu_inc_return.
+	 * Probe callbacks keep execution on the current CPU, so there is no
+	 * need to use migrate_disable for bpf_prog_run again. The check here
+	 * is just for __this_cpu_inc_return.
 	 */
 	cant_sleep();
 
@@ -2622,15 +2621,27 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 	}
 
 	rcu_read_lock();
-	regs = ftrace_partial_regs(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	old_run_ctx = bpf_set_run_ctx(&run_ctx.session_ctx.run_ctx);
 	err = bpf_prog_run(link->link.prog, regs);
 	bpf_reset_run_ctx(old_run_ctx);
-	ftrace_partial_regs_update(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	rcu_read_unlock();
 
  out:
 	__this_cpu_dec(bpf_prog_active);
+	return err;
+}
+
+static __always_inline int
+kprobe_multi_link_prog_run_ftrace(struct bpf_kprobe_multi_link *link,
+				  unsigned long entry_ip, struct ftrace_regs *fregs,
+				  bool is_return, void *data)
+{
+	struct pt_regs *regs;
+	int err;
+
+	regs = ftrace_partial_regs(fregs, bpf_kprobe_multi_pt_regs_ptr());
+	err = kprobe_multi_link_prog_run(link, entry_ip, regs, is_return, data);
+	ftrace_partial_regs_update(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	return err;
 }
 
@@ -2643,8 +2654,8 @@ kprobe_multi_link_handler(struct fprobe *fp, unsigned long fentry_ip,
 	int err;
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
-	err = kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
-					 fregs, false, data);
+	err = kprobe_multi_link_prog_run_ftrace(link, ftrace_get_entry_ip(fentry_ip),
+						fregs, false, data);
 	return is_kprobe_session(link->link.prog) ? err : 0;
 }
 
@@ -2656,8 +2667,8 @@ kprobe_multi_link_exit_handler(struct fprobe *fp, unsigned long fentry_ip,
 	struct bpf_kprobe_multi_link *link;
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
-	kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
-				   fregs, true, data);
+	kprobe_multi_link_prog_run_ftrace(link, ftrace_get_entry_ip(fentry_ip),
+					  fregs, true, data);
 }
 
 static int symbols_cmp_r(const void *a, const void *b, const void *priv)
