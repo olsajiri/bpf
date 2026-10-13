@@ -41,6 +41,7 @@
 struct bpf_verifier_env;
 struct bpf_verifier_log;
 struct perf_event;
+struct pt_regs;
 struct bpf_prog;
 struct bpf_prog_aux;
 struct bpf_map;
@@ -4281,6 +4282,8 @@ void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 
 void *bpf_arch_text_copy(void *dst, void *src, size_t len);
 int bpf_arch_text_invalidate(void *dst, size_t len);
+
+int bpf_arch_dwarf_regval(struct pt_regs *regs, u32 regno, u64 *value);
 
 struct btf_id_set;
 bool btf_id_set_contains(const struct btf_id_set *set, u32 id);
