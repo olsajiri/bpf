@@ -22,6 +22,8 @@
 #include <linux/bsearch.h>
 #include <linux/sort.h>
 #include <linux/key.h>
+#include <linux/kallsyms.h>
+#include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/file.h>
 
@@ -30,6 +32,7 @@
 #include <uapi/linux/bpf.h>
 #include <uapi/linux/btf.h>
 
+#include <asm/sections.h>
 #include <asm/tlb.h>
 
 #include "trace_probe.h"
@@ -2791,18 +2794,317 @@ static int addrs_check_error_injection_list(unsigned long *addrs, u32 cnt)
 struct kprobe_multi_resolved {
 	unsigned long *addrs;
 	u64 *cookies;
+	unsigned long *fprobe_addrs;
+	unsigned long *inline_addrs;
 	u32 cnt;
+	u32 fprobe_cnt;
+	u32 inline_cnt;
+	bool free_fprobe_addrs;
 };
 
 static void bpf_kprobe_multi_resolved_free(struct kprobe_multi_resolved *res)
 {
 	kvfree(res->addrs);
 	kvfree(res->cookies);
+	kvfree(res->inline_addrs);
+	if (res->free_fprobe_addrs)
+		kvfree(res->fprobe_addrs);
+}
+
+struct bpf_kprobe_multi_addr {
+	unsigned long addr;
+	u64 cookie;
+	bool inline_probe;
+};
+
+struct kprobe_multi_resolve_ctx {
+	const char **syms;
+	const u64 *cookies;
+	struct bpf_kprobe_multi_addr *addrs;
+	u8 *found;
+	u32 cnt;
+	u32 addr_cnt;
+};
+
+static int symbols_cmp(const void *a, const void *b)
+{
+	return symbols_cmp_r(a, b, NULL);
+}
+
+static int resolve_cb(void *data, const char *name, unsigned long addr)
+{
+	struct kprobe_multi_resolve_ctx *ctx = data;
+	const char **sym;
+	u32 i;
+
+	sym = bsearch(&name, ctx->syms, ctx->cnt, sizeof(*ctx->syms), symbols_cmp);
+	if (!sym)
+		return 0;
+	i = sym - ctx->syms;
+	while (i && !strcmp(ctx->syms[i - 1], name))
+		i--;
+	if (ctx->found[i] || !ftrace_location(addr))
+		return 0;
+
+	for (; i < ctx->cnt && !strcmp(ctx->syms[i], name); i++) {
+		ctx->addrs[ctx->addr_cnt++] = (struct bpf_kprobe_multi_addr){
+			.addr = addr,
+			.cookie = ctx->cookies ? ctx->cookies[i] : 0,
+		};
+		ctx->found[i] = 1;
+	}
+	return ctx->addr_cnt == ctx->cnt;
+}
+
+static int ftrace_lookup_symbols_partial(const char **sorted_syms, u32 cnt,
+					 int (*fn)(void *, const char *, unsigned long),
+					 void *data)
+{
+	unsigned long addr;
+	int err;
+
+	if (cnt == 1) {
+		if (!ftrace_lookup_symbols(sorted_syms, 1, &addr))
+			fn(data, sorted_syms[0], addr);
+		return 0;
+	}
+
+	err = kallsyms_on_each_symbol(fn, data);
+	if (err < 0 && err != -EOPNOTSUPP)
+		return err;
+	if (err <= 0 && IS_ENABLED(CONFIG_MODULES)) {
+		err = module_kallsyms_on_each_symbol(NULL, fn, data);
+		if (err < 0 && err != -EOPNOTSUPP)
+			return err;
+	}
+
+	return 0;
+}
+
+static int bpf_kprobe_multi_addr_cmp(const void *a, const void *b)
+{
+	const struct bpf_kprobe_multi_addr *addr_a = a, *addr_b = b;
+
+	if (addr_a->addr != addr_b->addr)
+		return addr_a->addr < addr_b->addr ? -1 : 1;
+	/* Keep the fprobe entry when an inline location shares its address. */
+	return (int)addr_a->inline_probe - (int)addr_b->inline_probe;
+}
+
+static int resolve_add_inline(struct kprobe_multi_resolve_ctx *ctx, u32 *cap,
+			      unsigned long addr, u64 cookie)
+{
+	struct bpf_kprobe_multi_addr *addrs;
+	u32 new_cap;
+
+	if (ctx->addr_cnt == MAX_KPROBE_MULTI_CNT)
+		return -E2BIG;
+	if (ctx->addr_cnt == *cap) {
+		new_cap = min_t(u32, MAX_KPROBE_MULTI_CNT,
+				max_t(u32, 16, *cap * 3 / 2));
+		addrs = kvrealloc(ctx->addrs, array_size(new_cap, sizeof(*addrs)),
+				  GFP_KERNEL);
+		if (!addrs)
+			return -ENOMEM;
+		ctx->addrs = addrs;
+		*cap = new_cap;
+	}
+	ctx->addrs[ctx->addr_cnt++] = (struct bpf_kprobe_multi_addr){
+		.addr = addr,
+		.cookie = cookie,
+		.inline_probe = true,
+	};
+	return 0;
 }
 
 static int
-bpf_kprobe_multi_resolve(const char **sorted_syms, u32 cnt,
-			 struct kprobe_multi_resolved *res)
+resolve_inline_btf(struct btf *inline_btf, struct kprobe_multi_resolve_ctx *ctx,
+		   u32 *cap)
+{
+	u32 base_cnt = btf_nr_types(btf_base_btf(inline_btf));
+	u32 nr_types = btf_nr_types(inline_btf);
+	u32 i, j;
+
+	for (i = base_cnt; i < nr_types; i++) {
+		const struct btf_type *t = btf_type_by_id(inline_btf, i);
+		const char *sec_name;
+		unsigned long base;
+		struct btf_loc *loc;
+
+		if (!t || btf_kind(t) != BTF_KIND_LOCSEC)
+			continue;
+		sec_name = btf_name_by_offset(inline_btf, t->name_off);
+		if (!sec_name)
+			continue;
+		if (!strcmp(sec_name, "inline.text")) {
+			base = (unsigned long)_text;
+		} else if (!strcmp(sec_name, "inline.init.text") &&
+			   system_state < SYSTEM_FREEING_INITMEM) {
+			base = (unsigned long)_sinittext;
+		} else {
+			continue;
+		}
+
+		for (j = 0, loc = btf_type_loc_secinfo(t); j < btf_type_vlen(t); j++, loc++) {
+			const struct btf_type *func;
+			const char *name;
+			const char **sym;
+			unsigned long addr;
+			u32 sym_idx;
+
+			func = btf_type_by_id(inline_btf, loc->func);
+			if (!func || btf_kind(func) != BTF_KIND_FUNC)
+				continue;
+			name = btf_name_by_offset(inline_btf, func->name_off);
+			if (!name)
+				continue;
+			sym = bsearch(&name, ctx->syms, ctx->cnt, sizeof(*ctx->syms), symbols_cmp);
+			if (!sym)
+				continue;
+			sym_idx = sym - ctx->syms;
+			if (loc->offset > ULONG_MAX - base)
+				return -EINVAL;
+			addr = base + loc->offset;
+			while (sym_idx && !strcmp(ctx->syms[sym_idx - 1], name))
+				sym_idx--;
+			for (; sym_idx < ctx->cnt && !strcmp(ctx->syms[sym_idx], name); sym_idx++) {
+				u64 cookie = ctx->cookies ? ctx->cookies[sym_idx] : 0;
+				int err;
+
+				err = resolve_add_inline(ctx, cap, addr, cookie);
+				if (err)
+					return err;
+				ctx->found[sym_idx] = 1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int
+ctx_to_resolved(struct kprobe_multi_resolve_ctx *ctx, u32 cnt, struct kprobe_multi_resolved *res)
+{
+	u32 fprobe_cnt = 0, inline_cnt = 0, i;
+	u32 fprobe_idx = 0, inline_idx = 0;
+	unsigned long *fprobe_addrs = NULL;
+	unsigned long *inline_addrs = NULL;
+	unsigned long *addrs = NULL;
+	u64 *cookies = NULL;
+
+	for (i = 0; i < cnt; i++) {
+		if (ctx->addrs[i].inline_probe)
+			inline_cnt++;
+		else
+			fprobe_cnt++;
+	}
+
+	addrs = kvmalloc_array(cnt, sizeof(*addrs), GFP_KERNEL);
+	if (res->cookies)
+		cookies = kvmalloc_array(cnt, sizeof(*cookies), GFP_KERNEL);
+	if (fprobe_cnt)
+		fprobe_addrs = kvmalloc_array(fprobe_cnt, sizeof(*fprobe_addrs), GFP_KERNEL);
+	if (inline_cnt)
+		inline_addrs = kvmalloc_array(inline_cnt, sizeof(*inline_addrs), GFP_KERNEL);
+
+	if (!addrs ||
+	    (res->cookies && !cookies) ||
+	    (fprobe_cnt && !fprobe_addrs) ||
+	    (inline_cnt && !inline_addrs)) {
+		kfree(addrs);
+		kfree(cookies);
+		kfree(fprobe_addrs);
+		kfree(inline_addrs);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < cnt; i++) {
+		addrs[i] = ctx->addrs[i].addr;
+		if (cookies)
+			cookies[i] = ctx->addrs[i].cookie;
+		if (ctx->addrs[i].inline_probe)
+			inline_addrs[inline_idx++] = ctx->addrs[i].addr;
+		else
+			fprobe_addrs[fprobe_idx++] = ctx->addrs[i].addr;
+	}
+
+	kvfree(res->cookies);
+
+	*res = (struct kprobe_multi_resolved){
+		.cookies      = cookies,
+		.addrs        = addrs,
+		.cnt          = cnt,
+		.fprobe_addrs = fprobe_addrs,
+		.inline_addrs = inline_addrs,
+		.fprobe_cnt   = fprobe_cnt,
+		.inline_cnt   = inline_cnt,
+		.free_fprobe_addrs = true,
+	};
+	return 0;
+}
+
+static int resolve_inline(const char **sorted_syms, u32 cnt,
+			  struct kprobe_multi_resolved *res)
+{
+	struct kprobe_multi_resolve_ctx ctx = {
+		.syms    = sorted_syms,
+		.cookies = res->cookies,
+		.cnt     = cnt,
+	};
+	struct btf *inline_btf;
+	u32 i, cap = cnt;
+	int err;
+
+	inline_btf = bpf_get_btf_vmlinux_inline();
+	if (IS_ERR(inline_btf))
+		return PTR_ERR(inline_btf);
+	if (!inline_btf)
+		return -EOPNOTSUPP;
+
+	ctx.addrs = kvmalloc_array(cap, sizeof(*ctx.addrs), GFP_KERNEL);
+	ctx.found = kcalloc(cnt, sizeof(*ctx.found), GFP_KERNEL);
+	if (!ctx.addrs || !ctx.found) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	err = ftrace_lookup_symbols_partial(sorted_syms, cnt, resolve_cb, &ctx);
+	if (err)
+		goto out;
+
+	err = resolve_inline_btf(inline_btf, &ctx, &cap);
+	if (err)
+		goto out;
+
+	for (i = 0; i < cnt; i++) {
+		if (!ctx.found[i]) {
+			err = -ENOENT;
+			goto out;
+		}
+	}
+	if (!ctx.addr_cnt) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	sort(ctx.addrs, ctx.addr_cnt, sizeof(*ctx.addrs), bpf_kprobe_multi_addr_cmp, NULL);
+
+	for (i = 0, cnt = 0; i < ctx.addr_cnt; i++) {
+		if (cnt && ctx.addrs[i].addr == ctx.addrs[cnt - 1].addr)
+			continue;
+		ctx.addrs[cnt++] = ctx.addrs[i];
+	}
+
+	err = ctx_to_resolved(&ctx, cnt, res);
+
+out:
+	kvfree(ctx.found);
+	kvfree(ctx.addrs);
+	return err;
+}
+
+static int resolve_static(const char **sorted_syms, u32 cnt,
+			  struct kprobe_multi_resolved *res)
 {
 	unsigned long *addrs;
 	int err;
@@ -2819,10 +3121,22 @@ bpf_kprobe_multi_resolve(const char **sorted_syms, u32 cnt,
 
 	*res = (struct kprobe_multi_resolved){
 		.cnt     = cnt,
-		.cookies = res->cookies,
-		.addrs   = addrs,
+		.cookies      = res->cookies,
+		.addrs        = addrs,
+		.fprobe_cnt   = cnt,
+		.fprobe_addrs = addrs,
+		.free_fprobe_addrs = false,
 	};
 	return 0;
+}
+
+static int
+bpf_kprobe_multi_resolve(const char **sorted_syms, u32 cnt, bool has_inline,
+			 struct kprobe_multi_resolved *res)
+{
+	if (has_inline)
+		return resolve_inline(sorted_syms, cnt, res);
+	return resolve_static(sorted_syms, cnt, res);
 }
 
 int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
@@ -2895,6 +3209,8 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 			goto error;
 		}
 		res.cnt = cnt;
+		res.fprobe_cnt = cnt;
+		res.fprobe_addrs = res.addrs;
 	} else {
 		struct multi_symbols_sort data = {
 			.cookies = res.cookies,
@@ -2911,7 +3227,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		sort_r(us.syms, cnt, sizeof(*us.syms), symbols_cmp_r,
 		       symbols_swap_r, &data);
 
-		err = bpf_kprobe_multi_resolve(us.syms, cnt, &res);
+		err = bpf_kprobe_multi_resolve(us.syms, cnt, false, &res);
 		free_user_syms(&us);
 		if (err)
 			goto error;
