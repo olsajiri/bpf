@@ -146,6 +146,118 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+static void test_inline_attach_args(void)
+{
+	const char *sym = "bpf_fentry_test_inline";
+	struct bpf_link *link = NULL, *fentry_link = NULL;
+	struct kprobe_multi_inline *skel = NULL;
+	int err;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+	if (skel->kconfig->CONFIG_DEBUG_INFO_BTF_INLINE == TRI_NO) {
+		test__skip();
+		goto cleanup;
+	}
+
+	skel->bss->inline_probe_pid = getpid();
+	fentry_link = bpf_program__attach(skel->progs.trigger);
+	err = libbpf_get_error(fentry_link);
+	if (!ASSERT_OK(err, "attach_trigger")) {
+		fentry_link = NULL;
+		goto cleanup;
+	}
+	{
+		LIBBPF_OPTS(bpf_kprobe_multi_opts, opts,
+			.syms = &sym,
+			.cnt = 1,
+			.inline_probes = true);
+
+		link = bpf_program__attach_kprobe_multi_opts(
+			skel->progs.test_kprobe_inline_args, NULL, &opts);
+	}
+	err = libbpf_get_error(link);
+	if (err == -EOPNOTSUPP) {
+		link = NULL;
+		test__skip();
+		goto cleanup;
+	}
+	if (!ASSERT_OK(err, "attach_inline_args_probes")) {
+		link = NULL;
+		goto cleanup;
+	}
+
+	{
+		LIBBPF_OPTS(bpf_test_run_opts, opts);
+
+		ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.trigger),
+						 &opts), "trigger_inline_arg_sites");
+		ASSERT_EQ(opts.retval, 0, "inline_args_test_run_retval");
+	}
+	ASSERT_EQ(skel->bss->inline_args_count, 3, "inline_args_probe_hits");
+	ASSERT_EQ(skel->bss->inline_args_mask, 7, "inline_args_all_invocations");
+	ASSERT_EQ(skel->bss->inline_args_errors, 0, "inline_args_errors");
+
+cleanup:
+	bpf_link__destroy(link);
+	bpf_link__destroy(fentry_link);
+	kprobe_multi_inline__destroy(skel);
+}
+
+static void test_regular_attach_args(void)
+{
+	const char *sym = "bpf_fentry_test1";
+	struct bpf_link *link = NULL, *fentry_link = NULL;
+	struct kprobe_multi_inline *skel = NULL;
+	int err;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->inline_probe_pid = getpid();
+	fentry_link = bpf_program__attach(skel->progs.trigger);
+	err = libbpf_get_error(fentry_link);
+	if (!ASSERT_OK(err, "attach_trigger")) {
+		fentry_link = NULL;
+		goto cleanup;
+	}
+	{
+		LIBBPF_OPTS(bpf_kprobe_multi_opts, opts,
+			.syms = &sym,
+			.cnt = 1);
+
+		link = bpf_program__attach_kprobe_multi_opts(
+			skel->progs.test_kprobe_multi_regular_args, NULL, &opts);
+	}
+	err = libbpf_get_error(link);
+	if (err == -EOPNOTSUPP) {
+		link = NULL;
+		test__skip();
+		goto cleanup;
+	}
+	if (!ASSERT_OK(err, "attach_regular_args_probe")) {
+		link = NULL;
+		goto cleanup;
+	}
+
+	{
+		LIBBPF_OPTS(bpf_test_run_opts, opts);
+
+		ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.trigger),
+						 &opts), "trigger_regular_function");
+		ASSERT_EQ(opts.retval, 0, "regular_test_run_retval");
+	}
+	ASSERT_EQ(skel->bss->regular_args_count, 1, "regular_args_probe_hits");
+	ASSERT_EQ(skel->bss->regular_args_errors, 0, "regular_args_errors");
+
+cleanup:
+	bpf_link__destroy(link);
+	bpf_link__destroy(fentry_link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 void serial_test_kprobe_multi_testmod_test(void)
 {
 	ksyms = load_kallsyms_local();
@@ -160,6 +272,12 @@ void serial_test_kprobe_multi_testmod_test(void)
 
 	if (test__start_subtest("inline_attach"))
 		test_inline_attach();
+
+	if (test__start_subtest("inline_attach_args"))
+		test_inline_attach_args();
+
+	if (test__start_subtest("regular_attach_args"))
+		test_regular_attach_args();
 
 	free_kallsyms_local(ksyms);
 }
