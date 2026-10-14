@@ -1,9 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <test_progs.h>
+#include <bpf/btf.h>
 #include "kprobe_multi.skel.h"
 #include "kprobe_multi_inline.skel.h"
 #include "trace_helpers.h"
 #include "bpf/libbpf_internal.h"
+
+#define BTF_INLINE_PATH "/sys/kernel/btf/vmlinux.inline"
+#define INLINE_SCAN_ENV "BPF_KPROBE_MULTI_INLINE_SCAN"
+
+struct inline_func_stat {
+	const char *name;
+	__u32 loc_count;
+	int attach_err;
+	__u64 attach_time_ns;
+};
+
+static int inline_func_stat_cmp(const void *a, const void *b)
+{
+	const struct inline_func_stat *func_a = a;
+	const struct inline_func_stat *func_b = b;
+
+	return strcmp(func_a->name, func_b->name);
+}
 
 static struct ksyms *ksyms;
 
@@ -280,4 +299,139 @@ void serial_test_kprobe_multi_testmod_test(void)
 		test_regular_attach_args();
 
 	free_kallsyms_local(ksyms);
+}
+
+void serial_test_kprobe_multi_inline_scan(void)
+{
+	struct kprobe_multi_inline *skel = NULL;
+	struct inline_func_stat *funcs = NULL;
+	struct btf *inline_btf = NULL, *vmlinux_btf = NULL;
+	const struct btf_type *func_type, *locsec;
+	const struct btf_loc *loc;
+	const char *scan = getenv(INLINE_SCAN_ENV);
+	unsigned long long text_base;
+	__u32 func_cnt = 0, loc_cnt, i, j;
+	bool scan_all;
+	int locsec_id, err;
+
+	if (!scan || !scan[0]) {
+		test__skip();
+		return;
+	}
+	test__force_log();
+	scan_all = !strcmp(scan, "all");
+
+	vmlinux_btf = btf__load_vmlinux_btf();
+	err = libbpf_get_error(vmlinux_btf);
+	if (!ASSERT_OK(err, "load_vmlinux_btf"))
+		return;
+
+	inline_btf = btf__parse_split(BTF_INLINE_PATH, vmlinux_btf);
+	err = libbpf_get_error(inline_btf);
+	if (err == -ENOENT || err == -EOPNOTSUPP) {
+		test__skip();
+		goto cleanup;
+	}
+	if (!ASSERT_OK(err, "parse_vmlinux_inline_btf"))
+		goto cleanup;
+
+	locsec_id = btf__find_by_name_kind(inline_btf, "inline.text", BTF_KIND_LOCSEC);
+	if (locsec_id < 0) {
+		test__skip();
+		goto cleanup;
+	}
+	locsec = btf__type_by_id(inline_btf, locsec_id);
+	loc_cnt = btf_vlen(locsec);
+	funcs = calloc(loc_cnt, sizeof(*funcs));
+	if (!ASSERT_OK_PTR(funcs, "alloc_inline_func_stats"))
+		goto cleanup;
+
+	for (i = 0, loc = btf_locsec_locs(locsec); i < loc_cnt; i++, loc++) {
+		const char *name;
+
+		func_type = btf__type_by_id(inline_btf, loc->func);
+		if (!func_type || !btf_is_func(func_type))
+			continue;
+		name = btf__name_by_offset(inline_btf, func_type->name_off);
+		if (!name || (!scan_all && strcmp(name, scan)))
+			continue;
+		funcs[func_cnt++] = (struct inline_func_stat){
+			.name = name,
+			.loc_count = 1,
+		};
+	}
+	qsort(funcs, func_cnt, sizeof(*funcs), inline_func_stat_cmp);
+	for (i = 0, j = 0; i < func_cnt; i++) {
+		if (j && !strcmp(funcs[j - 1].name, funcs[i].name)) {
+			funcs[j - 1].loc_count++;
+			continue;
+		}
+		funcs[j++] = funcs[i];
+	}
+	func_cnt = j;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		goto cleanup;
+	if (skel->kconfig->CONFIG_DEBUG_INFO_BTF_INLINE == TRI_NO) {
+		test__skip();
+		goto cleanup;
+	}
+	err = kallsyms_find("_text", &text_base);
+	if (!ASSERT_OK(err, "find_text_base") ||
+	    !ASSERT_NEQ(text_base, 0, "text_base_nonzero"))
+		goto cleanup;
+
+	printf("Inline kprobe attachment scan (" INLINE_SCAN_ENV "=%s)\n", scan);
+	printf("%-48s %10s %10s %10s %14s\n", "inline function", "locations",
+	       "attached", "error", "attach time (s)");
+	for (i = 0; i < func_cnt; i++) {
+		const char *sym = funcs[i].name;
+		struct bpf_link *link;
+		__u64 start_ns;
+
+		LIBBPF_OPTS(bpf_kprobe_multi_opts, opts,
+			.syms = &sym,
+			.cnt = 1,
+			.inline_probes = true);
+
+		start_ns = get_time_ns();
+		link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+							     NULL, &opts);
+		funcs[i].attach_time_ns = get_time_ns() - start_ns;
+		funcs[i].attach_err = libbpf_get_error(link);
+		if (!funcs[i].attach_err)
+			bpf_link__destroy(link);
+		printf("%-48s %10u %10s %10d %14.6f\n", funcs[i].name,
+		       funcs[i].loc_count,
+		       funcs[i].attach_err ? "no" : "yes",
+		       funcs[i].attach_err,
+		       (double)funcs[i].attach_time_ns / 1000000000.0);
+	}
+	if (!func_cnt && !scan_all)
+		printf("%-48s %10u %10s %10d %14.6f\n", scan, 0, "no", -ENOENT, 0.0);
+
+	printf("Locations for %s:\n", scan_all ? "all functions" : scan);
+	for (i = 0, loc = btf_locsec_locs(locsec); i < loc_cnt; i++, loc++) {
+		const char *name;
+		unsigned long long addr;
+
+		func_type = btf__type_by_id(inline_btf, loc->func);
+		if (!func_type || !btf_is_func(func_type))
+			continue;
+		name = btf__name_by_offset(inline_btf, func_type->name_off);
+		if (!name || (!scan_all && strcmp(name, scan)))
+			continue;
+		addr = text_base + loc->offset;
+		if (scan_all)
+			printf("  %-48s 0x%016llx\n", name, addr);
+		else
+			printf("  0x%016llx\n", addr);
+	}
+
+cleanup:
+	free(funcs);
+	kprobe_multi_inline__destroy(skel);
+	btf__free(inline_btf);
+	btf__free(vmlinux_btf);
 }
