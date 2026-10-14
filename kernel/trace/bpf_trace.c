@@ -2361,23 +2361,29 @@ struct bpf_session_run_ctx {
 #ifdef CONFIG_FPROBE
 struct bpf_kprobe_multi_link;
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 struct bpf_kprobe_multi_kprobe {
 	struct kprobe kp;
 	struct bpf_kprobe_multi_link *link;
 };
+#endif
 
 enum bpf_kprobe_multi_info_type {
 	BPF_KPROBE_MULTI_INFO_NONE,
 	BPF_KPROBE_MULTI_INFO_FUNC,
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	BPF_KPROBE_MULTI_INFO_INLINE,
+#endif
 };
 
 struct bpf_kprobe_multi_addr_info {
 	enum bpf_kprobe_multi_info_type type;
 	u32 arg_cnt;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	struct {
 		const struct btf_type *loc_proto;
 	} inline_info;
+#endif
 };
 
 struct bpf_kprobe_multi_link {
@@ -2385,11 +2391,15 @@ struct bpf_kprobe_multi_link {
 	struct fprobe fp;
 	unsigned long *addrs;
 	u64 *cookies;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	struct bpf_kprobe_multi_kprobe *inline_probes;
 	struct kprobe **inline_kps;
+#endif
 	struct bpf_kprobe_multi_addr_info *addr_info;
 	u32 cnt;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	u32 inline_cnt;
+#endif
 	u32 fprobe_cnt;
 	u32 mods_cnt;
 	struct module **mods;
@@ -2485,10 +2495,12 @@ static void bpf_kprobe_multi_link_unregister(struct bpf_kprobe_multi_link *link)
 		unregister_fprobe_async(&link->fp);
 		link->fprobe_cnt = 0;
 	}
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	if (link->inline_cnt) {
 		unregister_kprobes(link->inline_kps, link->inline_cnt);
 		link->inline_cnt = 0;
 	}
+#endif
 }
 
 static void bpf_kprobe_multi_link_release(struct bpf_link *link)
@@ -2507,8 +2519,10 @@ static void bpf_kprobe_multi_link_dealloc(struct bpf_link *link)
 	kmulti_link = container_of(link, struct bpf_kprobe_multi_link, link);
 	kvfree(kmulti_link->addrs);
 	kvfree(kmulti_link->cookies);
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	kvfree(kmulti_link->inline_kps);
 	kvfree(kmulti_link->inline_probes);
+#endif
 	kvfree(kmulti_link->addr_info);
 	kfree(kmulti_link->mods);
 	kfree(kmulti_link);
@@ -2683,6 +2697,7 @@ bpf_kprobe_multi_addr_info_for_ip(struct bpf_kprobe_multi_run_ctx *run_ctx)
 	return &link->addr_info[addr - link->addrs];
 }
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 static int bpf_kprobe_multi_read_reg(struct pt_regs *regs, u32 regno, u64 *value)
 {
 #ifdef CONFIG_X86_64
@@ -2867,6 +2882,7 @@ static int bpf_get_func_arg_kprobe_multi_inline(struct pt_regs *regs,
 		return -EINVAL;
 	return bpf_kprobe_multi_eval_loc_param(param, regs, value);
 }
+#endif
 
 BPF_CALL_3(bpf_get_func_arg_kprobe_multi, void *, ctx, u32, n, u64 *, value)
 {
@@ -2878,9 +2894,11 @@ BPF_CALL_3(bpf_get_func_arg_kprobe_multi, void *, ctx, u32, n, u64 *, value)
 	info = bpf_kprobe_multi_addr_info_for_ip(run_ctx);
 	if (!info)
 		return -EOPNOTSUPP;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	if (info->type == BPF_KPROBE_MULTI_INFO_INLINE)
 		return bpf_get_func_arg_kprobe_multi_inline((struct pt_regs *)ctx,
 							   info, n, value);
+#endif
 	if (info->type != BPF_KPROBE_MULTI_INFO_FUNC || !run_ctx->fregs)
 		return -EOPNOTSUPP;
 	if (n >= info->arg_cnt)
@@ -2908,8 +2926,10 @@ BPF_CALL_1(bpf_get_func_arg_cnt_kprobe_multi, void *, ctx)
 	info = bpf_kprobe_multi_addr_info_for_ip(run_ctx);
 	if (!info)
 		return 0;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	if (info->type == BPF_KPROBE_MULTI_INFO_INLINE)
 		return info->arg_cnt;
+#endif
 	if (info->type != BPF_KPROBE_MULTI_INFO_FUNC)
 		return 0;
 	return info->arg_cnt;
@@ -2976,6 +2996,7 @@ kprobe_multi_link_prog_run_ftrace(struct bpf_kprobe_multi_link *link,
 	return err;
 }
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 static int bpf_kprobe_multi_kprobe_pre_handler(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct bpf_kprobe_multi_kprobe *probe;
@@ -3018,6 +3039,7 @@ error_free:
 	link->inline_probes = inline_probes;
 	return 0;
 }
+#endif
 
 static int
 kprobe_multi_link_handler(struct fprobe *fp, unsigned long fentry_ip,
@@ -3166,11 +3188,15 @@ struct kprobe_multi_resolved {
 	unsigned long *addrs;
 	u64 *cookies;
 	unsigned long *fprobe_addrs;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	unsigned long *inline_addrs;
+#endif
 	struct bpf_kprobe_multi_addr_info *addr_info;
 	u32 cnt;
 	u32 fprobe_cnt;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	u32 inline_cnt;
+#endif
 	bool free_fprobe_addrs;
 };
 
@@ -3178,12 +3204,15 @@ static void bpf_kprobe_multi_resolved_free(struct kprobe_multi_resolved *res)
 {
 	kvfree(res->addrs);
 	kvfree(res->cookies);
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	kvfree(res->inline_addrs);
+#endif
 	kvfree(res->addr_info);
 	if (res->free_fprobe_addrs)
 		kvfree(res->fprobe_addrs);
 }
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 struct bpf_kprobe_multi_addr {
 	unsigned long addr;
 	u64 cookie;
@@ -3529,6 +3558,7 @@ out:
 	kvfree(ctx.addrs);
 	return err;
 }
+#endif
 
 static int resolve_static(const char **sorted_syms, u32 cnt,
 			  struct kprobe_multi_resolved *res)
@@ -3586,6 +3616,7 @@ static int resolve_static(const char **sorted_syms, u32 cnt,
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 static int
 bpf_kprobe_multi_resolve(const char **sorted_syms, u32 cnt, bool has_inline,
 			 struct kprobe_multi_resolved *res)
@@ -3594,6 +3625,7 @@ bpf_kprobe_multi_resolve(const char **sorted_syms, u32 cnt, bool has_inline,
 		return resolve_inline(sorted_syms, cnt, res);
 	return resolve_static(sorted_syms, cnt, res);
 }
+#endif
 
 int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 {
@@ -3604,7 +3636,9 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	u32 flags, cnt, size;
 	void __user *uaddrs;
 	void __user *usyms;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	bool has_inline;
+#endif
 	int err;
 
 	/* no support for 32bit archs yet */
@@ -3629,6 +3663,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	if (flags & ~(BPF_F_KPROBE_MULTI_RETURN | BPF_F_KPROBE_MULTI_INLINE))
 		return -EINVAL;
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	has_inline = flags & BPF_F_KPROBE_MULTI_INLINE;
 	if (has_inline) {
 		if (flags & BPF_F_KPROBE_MULTI_RETURN)
@@ -3636,13 +3671,19 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		if (is_kprobe_session(prog) || prog->kprobe_override)
 			return -EINVAL;
 	}
+#else
+	if (flags & BPF_F_KPROBE_MULTI_INLINE)
+		return -EOPNOTSUPP;
+#endif
 
 	uaddrs = u64_to_user_ptr(attr->link_create.kprobe_multi.addrs);
 	usyms = u64_to_user_ptr(attr->link_create.kprobe_multi.syms);
 	if (!!uaddrs == !!usyms)
 		return -EINVAL;
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	if (has_inline && uaddrs)
 		return -EINVAL;
+#endif
 
 	cnt = attr->link_create.kprobe_multi.cnt;
 	if (!cnt)
@@ -3694,7 +3735,11 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		sort_r(us.syms, cnt, sizeof(*us.syms), symbols_cmp_r,
 		       symbols_swap_r, &data);
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 		err = bpf_kprobe_multi_resolve(us.syms, cnt, has_inline, &res);
+#else
+		err = resolve_static(us.syms, cnt, &res);
+#endif
 		free_user_syms(&us);
 		if (err)
 			goto error;
@@ -3736,7 +3781,11 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	res.cookies = NULL;
 	res.addr_info = NULL;
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	if (!has_inline && (link->cookies || link->addr_info)) {
+#else
+	if (link->cookies || link->addr_info) {
+#endif
 		/*
 		 * Keep addresses and their associated metadata sorted together,
 		 * so they can be found by address in the probe handlers.
@@ -3759,6 +3808,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		link->fprobe_cnt = res.fprobe_cnt;
 	}
 
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	if (res.inline_cnt) {
 		err = register_inline_probes(link, res.inline_addrs, res.inline_cnt);
 		if (err) {
@@ -3767,6 +3817,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		}
 		link->inline_cnt = res.inline_cnt;
 	}
+#endif
 
 	bpf_kprobe_multi_resolved_free(&res);
 	return bpf_link_settle(&link_primer);
