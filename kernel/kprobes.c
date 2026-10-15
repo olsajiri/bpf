@@ -476,7 +476,7 @@ bool kprobe_disarmed(struct kprobe *p)
 	return kprobe_disabled(p) && list_empty(&op->list);
 }
 
-/* Return true if the probe is queued on (un)optimizing lists */
+/* Return true if the probe is queued for preparation or (un)optimization. */
 static bool kprobe_queued(struct kprobe *p)
 {
 	struct optimized_kprobe *op;
@@ -516,8 +516,11 @@ static struct kprobe *get_optimized_kprobe(kprobe_opcode_t *addr)
 static LIST_HEAD(optimizing_list);
 static LIST_HEAD(unoptimizing_list);
 static LIST_HEAD(freeing_list);
+static LIST_HEAD(preparing_list);
 
 static void optimize_kprobe(struct kprobe *p);
+static void __optimize_kprobe(struct kprobe *p, bool kick);
+static void prepare_optimized_kprobe(struct kprobe *p);
 static struct task_struct *kprobe_optimizer_task;
 static wait_queue_head_t kprobe_optimizer_wait;
 static atomic_t optimizer_state;
@@ -557,6 +560,32 @@ static void do_optimize_kprobes(void)
 		return;
 
 	arch_optimize_kprobes(&optimizing_list);
+}
+
+/* Prepare optprobes queued on 'preparing_list'. */
+static void do_prepare_optimized_kprobes(void)
+{
+	struct optimized_kprobe *op, *tmp;
+
+	lockdep_assert_held(&text_mutex);
+
+	list_for_each_entry_safe(op, tmp, &preparing_list, list) {
+		list_del_init(&op->list);
+
+		/* The probe may have been disabled while preparation was queued. */
+		if (kprobes_all_disarmed || !kprobes_allow_optimization ||
+		    kprobe_disabled(&op->kp) || op->kp.post_handler)
+			continue;
+
+		if (arch_prepare_optimized_kprobe(op, &op->kp) ||
+		    !arch_prepared_optinsn(&op->optinsn)) {
+			/* Keep the aggregate as a regular breakpoint kprobe. */
+			arch_remove_optimized_kprobe(op);
+			continue;
+		}
+
+		__optimize_kprobe(&op->kp, false);
+	}
 }
 
 /*
@@ -630,6 +659,17 @@ static void kprobe_optimizer(void)
 	guard(mutex)(&kprobe_mutex);
 
 	scoped_guard(cpus_read_lock) {
+		/*
+		 * Prepare instructions with the same lock order as registration.
+		 * Keep this outside the later text_mutex section so we can take
+		 * jump_label_lock before text_mutex.
+		 */
+		if (!list_empty(&preparing_list)) {
+			guard(jump_label_lock)();
+			guard(mutex)(&text_mutex);
+			do_prepare_optimized_kprobes();
+		}
+
 		guard(mutex)(&text_mutex);
 
 		/*
@@ -660,7 +700,8 @@ static void kprobe_optimizer(void)
 	optimizer_passes++;
 	wake_up_var_locked(&optimizer_passes, &kprobe_mutex);
 
-	if (!list_empty(&optimizing_list) || !list_empty(&unoptimizing_list))
+	if (!list_empty(&preparing_list) || !list_empty(&optimizing_list) ||
+	    !list_empty(&unoptimizing_list))
 		kick_kprobe_optimizer();	/*normal kick*/
 }
 
@@ -709,7 +750,8 @@ static void wait_for_kprobe_optimizer_locked(void)
 {
 	lockdep_assert_held(&kprobe_mutex);
 
-	while (!list_empty(&optimizing_list) || !list_empty(&unoptimizing_list)) {
+	while (!list_empty(&preparing_list) || !list_empty(&optimizing_list) ||
+	       !list_empty(&unoptimizing_list)) {
 		unsigned long passes = optimizer_passes;
 
 		/*
@@ -750,18 +792,24 @@ bool optprobe_queued_unopt(struct optimized_kprobe *op)
 }
 
 /* Optimize kprobe if p is ready to be optimized */
-static void optimize_kprobe(struct kprobe *p)
+static void __optimize_kprobe(struct kprobe *p, bool kick)
 {
 	struct optimized_kprobe *op;
 
 	/* Check if the kprobe is disabled or not ready for optimization. */
-	if (!kprobe_optready(p) || !kprobes_allow_optimization ||
-	    (kprobe_disabled(p) || kprobes_all_disarmed))
+	if (!kprobes_allow_optimization || kprobe_disabled(p) ||
+	    kprobes_all_disarmed)
 		return;
 
 	/* kprobes with 'post_handler' can not be optimized */
 	if (p->post_handler)
 		return;
+
+	if (!kprobe_optready(p)) {
+		if (kprobe_aggrprobe(p))
+			prepare_optimized_kprobe(p);
+		return;
+	}
 
 	op = container_of(p, struct optimized_kprobe, kp);
 
@@ -787,7 +835,13 @@ static void optimize_kprobe(struct kprobe *p)
 		return;
 
 	list_add(&op->list, &optimizing_list);
-	kick_kprobe_optimizer();
+	if (kick)
+		kick_kprobe_optimizer();
+}
+
+static void optimize_kprobe(struct kprobe *p)
+{
+	__optimize_kprobe(p, true);
 }
 
 /* Short cut to direct unoptimizing */
@@ -803,11 +857,17 @@ static void unoptimize_kprobe(struct kprobe *p, bool force)
 {
 	struct optimized_kprobe *op;
 
-	if (!kprobe_aggrprobe(p) || kprobe_disarmed(p))
+	if (!kprobe_aggrprobe(p))
 		return; /* This is not an optprobe nor optimized */
 
 	op = container_of(p, struct optimized_kprobe, kp);
-	if (!kprobe_optimized(p))
+	if (!kprobe_optimized(p)) {
+		/* A not-yet-prepared probe must not outlive its registration. */
+		if (!list_empty(&op->list))
+			list_del_init(&op->list);
+		return;
+	}
+	if (kprobe_disarmed(p))
 		return;
 
 	if (!list_empty(&op->list)) {
@@ -885,23 +945,20 @@ static void kill_optimized_kprobe(struct kprobe *p)
 	arch_remove_optimized_kprobe(op);
 }
 
-static inline
-void __prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *p)
-{
-	if (!kprobe_ftrace(p))
-		arch_prepare_optimized_kprobe(op, p);
-}
-
-/* Try to prepare optimized instructions */
+/* Queue optprobe preparation for the optimizer thread. */
 static void prepare_optimized_kprobe(struct kprobe *p)
 {
 	struct optimized_kprobe *op;
 
 	op = container_of(p, struct optimized_kprobe, kp);
-	__prepare_optimized_kprobe(op, p);
+	if (kprobe_ftrace(p) || !list_empty(&op->list))
+		return;
+
+	list_add(&op->list, &preparing_list);
+	kick_kprobe_optimizer();
 }
 
-/* Allocate new optimized_kprobe and try to prepare optimized instructions. */
+/* Allocate a new optimized_kprobe without preparing it synchronously. */
 static struct kprobe *alloc_aggr_kprobe(struct kprobe *p)
 {
 	struct optimized_kprobe *op;
@@ -912,7 +969,6 @@ static struct kprobe *alloc_aggr_kprobe(struct kprobe *p)
 
 	INIT_LIST_HEAD(&op->list);
 	op->kp.addr = p->addr;
-	__prepare_optimized_kprobe(op, p);
 
 	return &op->kp;
 }
@@ -926,28 +982,17 @@ static void init_aggr_kprobe(struct kprobe *ap, struct kprobe *p);
 static void try_to_optimize_kprobe(struct kprobe *p)
 {
 	struct kprobe *ap;
-	struct optimized_kprobe *op;
 
 	/* Impossible to optimize ftrace-based kprobe. */
-	if (kprobe_ftrace(p))
+	if (kprobe_ftrace(p) || p->post_handler)
 		return;
 
-	/* For preparing optimization, jump_label_text_reserved() is called. */
-	guard(cpus_read_lock)();
-	guard(jump_label_lock)();
+	/* Replace the registered probe under the text update lock. */
 	guard(mutex)(&text_mutex);
 
 	ap = alloc_aggr_kprobe(p);
 	if (!ap)
 		return;
-
-	op = container_of(ap, struct optimized_kprobe, kp);
-	if (!arch_prepared_optinsn(&op->optinsn)) {
-		/* If failed to setup optimizing, fallback to kprobe. */
-		arch_remove_optimized_kprobe(op);
-		kfree(op);
-		return;
-	}
 
 	init_aggr_kprobe(ap, p);
 	optimize_kprobe(ap);	/* This just kicks optimizer thread. */
@@ -1383,6 +1428,7 @@ static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p)
 			if (!ap)
 				return -ENOMEM;
 			init_aggr_kprobe(ap, orig_p);
+			optimize_kprobe(ap);
 		} else if (kprobe_unused(ap)) {
 			/* This probe is going to die. Rescue it */
 			ret = reuse_unused_kprobe(ap);
@@ -1405,9 +1451,6 @@ static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p)
 				 * freed by unregister_kprobe().
 				 */
 				return ret;
-
-			/* Prepare optimized instructions if possible. */
-			prepare_optimized_kprobe(ap);
 
 			/*
 			 * Clear gone flag to prevent allocating new slot again, and
@@ -1434,6 +1477,8 @@ static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p)
 			}
 		}
 	}
+	if (!ret && !kprobe_disabled(ap) && !kprobe_optready(ap))
+		optimize_kprobe(ap);
 	return ret;
 }
 
