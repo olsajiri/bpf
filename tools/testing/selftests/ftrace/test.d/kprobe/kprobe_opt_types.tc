@@ -17,18 +17,40 @@ ppc*)
 esac
 
 DEFAULT=$(cat /proc/sys/debug/kprobes-optimization)
+cleanup() {
+	echo 0 > events/optprobe_test/enable 2>/dev/null || true
+	echo > kprobe_events || true
+	echo "$DEFAULT" > /proc/sys/debug/kprobes-optimization || true
+}
+trap cleanup EXIT
+
 echo 1 > /proc/sys/debug/kprobes-optimization
+
+# Exercise unregistering a candidate before deferred preparation completes.
 for i in `seq 0 255`; do
-        echo  "p:testprobe $FUNCTION_FORK+${i}" > kprobe_events || continue
-        echo 1 > events/kprobes/enable || continue
-        (echo "forked")
-	PROBE=$(grep $FUNCTION_FORK /sys/kernel/debug/kprobes/list)
-        echo 0 > events/kprobes/enable
-        echo > kprobe_events
-	if echo $PROBE | grep -q OPTIMIZED; then
-                echo "$DEFAULT" >  /proc/sys/debug/kprobes-optimization
-                exit_pass
-        fi
+	if echo "p:optprobe_cancel/pending $FUNCTION_FORK+$i" >> kprobe_events; then
+		echo 1 > events/optprobe_cancel/enable || exit_unresolved
+		echo 0 > events/optprobe_cancel/enable
+		echo "-:optprobe_cancel/pending" >> kprobe_events
+		break
+	fi
 done
-echo "$DEFAULT" >  /proc/sys/debug/kprobes-optimization
+
+for i in `seq 0 255`; do
+	echo "p:optprobe_test/probe_$i $FUNCTION_FORK+$i" >> kprobe_events || continue
+done
+
+echo 1 > events/optprobe_test/enable || exit_unresolved
+( echo "forked" )
+
+# Preparation and text patching are asynchronous. Keep the probes enabled
+# until the optimizer has had time to process the queued candidates.
+for i in `seq 0 300`; do
+	PROBE=$(grep "$FUNCTION_FORK" /sys/kernel/debug/kprobes/list)
+	if echo "$PROBE" | grep -q OPTIMIZED; then
+		exit_pass
+	fi
+	sleep 0.1
+done
+
 exit_unresolved
