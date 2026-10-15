@@ -8,6 +8,7 @@
  */
 #include <linux/memory.h>
 #include <linux/uaccess.h>
+#include <linux/cache.h>
 #include <linux/module.h>
 #include <linux/list.h>
 #include <linux/slab.h>
@@ -17,10 +18,17 @@
 #include <linux/jump_label_ratelimit.h>
 #include <linux/bug.h>
 #include <linux/cpu.h>
+#include <linux/site_index.h>
 #include <asm/sections.h>
 
 /* mutex to protect coming/going of the jump_label table */
 static DEFINE_MUTEX(jump_label_mutex);
+
+/*
+ * Index jump entries by code address for text reservation lookups. The jump
+ * table itself is sorted by static-key address, then by code address per key.
+ */
+static struct site_index *jump_entry_index;
 
 void jump_label_lock(void)
 {
@@ -381,6 +389,39 @@ static int addr_conflict(struct jump_entry *entry, void *start, void *end)
 	return 0;
 }
 
+static unsigned long jump_entry_index_addr(const void *entry)
+{
+	return jump_entry_code(entry);
+}
+
+static struct site_index *
+jump_entry_index_alloc(struct jump_entry *start, struct jump_entry *stop)
+{
+	return site_index_alloc(start, sizeof(*start), stop - start,
+				jump_entry_index_addr);
+}
+
+static int jump_entry_index_text_reserved(struct site_index *index,
+					  void *start, void *end, bool init)
+{
+	unsigned int i;
+
+	for (i = site_index_find(index, (unsigned long)start,
+				 jump_entry_index_addr);
+	     i < index->nr; i++) {
+		struct jump_entry *entry = index->entries[i];
+
+		/* Later entries cannot overlap once this address is past @end. */
+		if (jump_entry_code(entry) > (unsigned long)end)
+			break;
+		if ((init || !jump_entry_is_init(entry)) &&
+		    addr_conflict(entry, start, end))
+			return 1;
+	}
+
+	return 0;
+}
+
 static int __jump_label_text_reserved(struct jump_entry *iter_start,
 		struct jump_entry *iter_stop, void *start, void *end, bool init)
 {
@@ -653,7 +694,11 @@ static int __jump_label_mod_text_reserved(void *start, void *end)
 	if (!mod)
 		return 0;
 
-	ret = __jump_label_text_reserved(mod->jump_entries,
+	if (mod->jump_entry_index)
+		ret = jump_entry_index_text_reserved(mod->jump_entry_index,
+				start, end, mod->state == MODULE_STATE_COMING);
+	else
+		ret = __jump_label_text_reserved(mod->jump_entries,
 				mod->jump_entries + mod->num_jump_entries,
 				start, end, mod->state == MODULE_STATE_COMING);
 
@@ -755,6 +800,9 @@ do_poke:
 			__jump_label_update(key, iter, iter_stop, true);
 	}
 
+	/* Allocation failure leaves reservation checks using the linear scan. */
+	mod->jump_entry_index = jump_entry_index_alloc(iter_start, iter_stop);
+
 	return 0;
 }
 
@@ -765,6 +813,9 @@ static void jump_label_del_module(struct module *mod)
 	struct jump_entry *iter;
 	struct static_key *key = NULL;
 	struct static_key_mod *jlm, **prev;
+
+	kvfree(mod->jump_entry_index);
+	mod->jump_entry_index = NULL;
 
 	for (iter = iter_start; iter < iter_stop; iter++) {
 		if (jump_entry_key(iter) == key)
@@ -869,8 +920,16 @@ early_initcall(jump_label_init_module);
  */
 int jump_label_text_reserved(void *start, void *end)
 {
+	struct site_index *index;
 	bool init = system_state < SYSTEM_RUNNING;
-	int ret = __jump_label_text_reserved(__start___jump_table,
+	int ret;
+
+	/* Pairs with the release in jump_entry_index_build(). */
+	index = smp_load_acquire(&jump_entry_index);
+	if (index)
+		ret = jump_entry_index_text_reserved(index, start, end, init);
+	else
+		ret = __jump_label_text_reserved(__start___jump_table,
 			__stop___jump_table, start, end, init);
 
 	if (ret)
@@ -908,6 +967,23 @@ static void jump_label_update(struct static_key *key)
 	if (entry)
 		__jump_label_update(key, entry, stop, init);
 }
+
+static int __init jump_entry_index_build(void)
+{
+	struct site_index *index;
+
+	/*
+	 * Build the index in an initcall so normal memory allocation is
+	 * available; jump_label_init() runs before that.
+	 */
+	index = jump_entry_index_alloc(__start___jump_table, __stop___jump_table);
+
+	/* Publish the initialized index to jump_label_text_reserved(). */
+	smp_store_release(&jump_entry_index, index);
+
+	return 0;
+}
+late_initcall(jump_entry_index_build);
 
 #ifdef CONFIG_STATIC_KEYS_SELFTEST
 static DEFINE_STATIC_KEY_TRUE(sk_true);
