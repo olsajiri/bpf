@@ -8,8 +8,10 @@
  */
 #include <linux/memory.h>
 #include <linux/uaccess.h>
+#include <linux/cache.h>
 #include <linux/module.h>
 #include <linux/list.h>
+#include <linux/memblock.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/err.h>
@@ -21,6 +23,18 @@
 
 /* mutex to protect coming/going of the jump_label table */
 static DEFINE_MUTEX(jump_label_mutex);
+
+struct jump_entry_index_entry {
+	struct jump_entry *entry;
+	unsigned long max_end;
+};
+
+struct jump_entry_index {
+	unsigned int nr;
+	struct jump_entry_index_entry entries[];
+};
+
+static struct jump_entry_index *core_jump_entry_index;
 
 void jump_label_lock(void)
 {
@@ -381,6 +395,110 @@ static int addr_conflict(struct jump_entry *entry, void *start, void *end)
 	return 0;
 }
 
+static int jump_entry_index_cmp(const void *a, const void *b)
+{
+	const struct jump_entry_index_entry *ea = a;
+	const struct jump_entry_index_entry *eb = b;
+	unsigned long ca = jump_entry_code(ea->entry);
+	unsigned long cb = jump_entry_code(eb->entry);
+
+	if (ca < cb)
+		return -1;
+	if (ca > cb)
+		return 1;
+	return 0;
+}
+
+static void jump_entry_index_init(struct jump_entry_index *index,
+				  struct jump_entry *iter_start,
+				  struct jump_entry *iter_stop)
+{
+	unsigned int nr, i;
+	unsigned long max_end = 0;
+
+	nr = iter_stop - iter_start;
+	index->nr = nr;
+	for (i = 0; i < nr; i++)
+		index->entries[i].entry = iter_start + i;
+
+	sort(index->entries, nr, sizeof(index->entries[0]),
+	     jump_entry_index_cmp, NULL);
+
+	for (i = 0; i < nr; i++) {
+		struct jump_entry *entry = index->entries[i].entry;
+		unsigned long end = jump_entry_code(entry) + jump_entry_size(entry);
+
+		if (end > max_end)
+			max_end = end;
+		index->entries[i].max_end = max_end;
+	}
+
+}
+
+static struct jump_entry_index *
+jump_entry_index_alloc(struct jump_entry *iter_start,
+		       struct jump_entry *iter_stop)
+{
+	struct jump_entry_index *index;
+	unsigned int nr = iter_stop - iter_start;
+
+	if (!nr)
+		return NULL;
+
+	index = kvmalloc(struct_size(index, entries, nr), GFP_KERNEL);
+	if (index)
+		jump_entry_index_init(index, iter_start, iter_stop);
+
+	return index;
+}
+
+static void __init jump_label_build_core_index(void)
+{
+	struct jump_entry *iter_start = __start___jump_table;
+	struct jump_entry *iter_stop = __stop___jump_table;
+	unsigned int nr;
+
+	if (core_jump_entry_index || iter_start == iter_stop)
+		return;
+
+	nr = iter_stop - iter_start;
+	core_jump_entry_index = memblock_alloc(
+			struct_size(core_jump_entry_index, entries, nr),
+			SMP_CACHE_BYTES);
+	if (core_jump_entry_index)
+		jump_entry_index_init(core_jump_entry_index, iter_start, iter_stop);
+}
+
+static int jump_entry_index_text_reserved(struct jump_entry_index *index,
+					  void *start, void *end, bool init)
+{
+	unsigned long start_addr = (unsigned long)start;
+	unsigned long end_addr = (unsigned long)end;
+	unsigned int low = 0, high = index->nr, i;
+
+	/* Find the first prefix whose intervals could overlap @start. */
+	while (low < high) {
+		unsigned int mid = low + (high - low) / 2;
+
+		if (index->entries[mid].max_end <= start_addr)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	for (i = low; i < index->nr; i++) {
+		struct jump_entry *entry = index->entries[i].entry;
+
+		if (jump_entry_code(entry) > end_addr)
+			break;
+		if ((init || !jump_entry_is_init(entry)) &&
+		    addr_conflict(entry, start, end))
+			return 1;
+	}
+
+	return 0;
+}
+
 static int __jump_label_text_reserved(struct jump_entry *iter_start,
 		struct jump_entry *iter_stop, void *start, void *end, bool init)
 {
@@ -529,8 +647,13 @@ void __init jump_label_init(void)
 	struct static_key *key = NULL;
 	struct jump_entry *iter;
 
-	if (static_key_initialized)
+	if (static_key_initialized) {
+		/* Retry after setup_arch() has made memblock memory available. */
+		jump_label_lock();
+		jump_label_build_core_index();
+		jump_label_unlock();
 		return;
+	}
 
 	cpus_read_lock();
 	jump_label_lock();
@@ -554,6 +677,7 @@ void __init jump_label_init(void)
 		key = iterk;
 		static_key_set_entries(key, iter);
 	}
+	jump_label_build_core_index();
 	static_key_initialized = true;
 	jump_label_unlock();
 	cpus_read_unlock();
@@ -653,9 +777,14 @@ static int __jump_label_mod_text_reserved(void *start, void *end)
 	if (!mod)
 		return 0;
 
-	ret = __jump_label_text_reserved(mod->jump_entries,
-				mod->jump_entries + mod->num_jump_entries,
+	if (mod->jump_label_index)
+		ret = jump_entry_index_text_reserved(mod->jump_label_index,
 				start, end, mod->state == MODULE_STATE_COMING);
+	else
+		ret = __jump_label_text_reserved(mod->jump_entries,
+					mod->jump_entries + mod->num_jump_entries,
+					start, end,
+					mod->state == MODULE_STATE_COMING);
 
 	module_put(mod);
 
@@ -700,6 +829,7 @@ static int jump_label_add_module(struct module *mod)
 		return 0;
 
 	jump_label_sort_entries(iter_start, iter_stop);
+	mod->jump_label_index = jump_entry_index_alloc(iter_start, iter_stop);
 
 	for (iter = iter_start; iter < iter_stop; iter++) {
 		struct static_key *iterk;
@@ -810,6 +940,9 @@ static void jump_label_del_module(struct module *mod)
 			kfree(jlm);
 		}
 	}
+
+	kvfree(mod->jump_label_index);
+	mod->jump_label_index = NULL;
 }
 
 static int
@@ -870,8 +1003,14 @@ early_initcall(jump_label_init_module);
 int jump_label_text_reserved(void *start, void *end)
 {
 	bool init = system_state < SYSTEM_RUNNING;
-	int ret = __jump_label_text_reserved(__start___jump_table,
-			__stop___jump_table, start, end, init);
+	int ret;
+
+	if (core_jump_entry_index)
+		ret = jump_entry_index_text_reserved(core_jump_entry_index,
+						     start, end, init);
+	else
+		ret = __jump_label_text_reserved(__start___jump_table,
+					 __stop___jump_table, start, end, init);
 
 	if (ret)
 		return ret;
