@@ -717,6 +717,17 @@ enum {
 
 void ftrace_sync_ipi(void *data);
 
+struct ftrace_page;
+
+/* Iterator over ftrace locations within one address range. */
+struct ftrace_dyn_iter {
+	struct ftrace_page *page;
+	unsigned long	start;
+	unsigned long	end;
+	unsigned int	index;
+	bool		active;
+};
+
 #ifdef CONFIG_DYNAMIC_FTRACE
 
 void ftrace_arch_code_modify_prepare(void);
@@ -851,6 +862,11 @@ struct ftrace_rec_iter;
 struct ftrace_rec_iter *ftrace_rec_iter_start(void);
 struct ftrace_rec_iter *ftrace_rec_iter_next(struct ftrace_rec_iter *iter);
 struct dyn_ftrace *ftrace_rec_iter_record(struct ftrace_rec_iter *iter);
+
+unsigned long ftrace_dyn_iter_start(struct ftrace_dyn_iter *iter,
+				    unsigned long start, unsigned long end);
+unsigned long ftrace_dyn_iter_next(struct ftrace_dyn_iter *iter);
+void ftrace_dyn_iter_stop(struct ftrace_dyn_iter *iter);
 
 #define for_ftrace_rec_iter(iter)		\
 	for (iter = ftrace_rec_iter_start();	\
@@ -1061,6 +1077,21 @@ extern void ftrace_module_init(struct module *mod);
 extern void ftrace_module_enable(struct module *mod);
 extern void ftrace_release_mod(struct module *mod);
 #else /* CONFIG_DYNAMIC_FTRACE */
+static inline unsigned long
+ftrace_dyn_iter_start(struct ftrace_dyn_iter *iter, unsigned long start,
+		      unsigned long end)
+{
+	iter->active = false;
+	return 0;
+}
+
+static inline unsigned long ftrace_dyn_iter_next(struct ftrace_dyn_iter *iter)
+{
+	return 0;
+}
+
+static inline void ftrace_dyn_iter_stop(struct ftrace_dyn_iter *iter) { }
+
 static inline int skip_trace(unsigned long ip) { return 0; }
 static inline void ftrace_module_init(struct module *mod) { }
 static inline void ftrace_module_enable(struct module *mod) { }
