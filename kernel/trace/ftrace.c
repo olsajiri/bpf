@@ -1679,6 +1679,135 @@ static struct dyn_ftrace *lookup_rec(unsigned long start, unsigned long end)
 	return rec;
 }
 
+static struct dyn_ftrace *lookup_rec_page(struct ftrace_page *pg,
+					  unsigned long start,
+					  unsigned long end)
+{
+	unsigned int low = 0, high = pg->index;
+	struct dyn_ftrace *rec;
+	unsigned int mid;
+
+	while (low < high) {
+		mid = low + (high - low) / 2;
+		rec = &pg->records[mid];
+		if (rec->ip + MCOUNT_INSN_SIZE <= start)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	if (low == pg->index)
+		return NULL;
+
+	rec = &pg->records[low];
+	if (rec->ip > end)
+		return NULL;
+
+	return rec;
+}
+
+static void ftrace_dyn_iter_unlock(struct ftrace_dyn_iter *iter)
+{
+	if (!iter->active)
+		return;
+
+	iter->active = false;
+	mutex_unlock(&ftrace_lock);
+}
+
+/**
+ * ftrace_dyn_iter_start - find the first ftrace location in an address range
+ * @iter: iterator state
+ * @start: inclusive start of the range
+ * @end: inclusive end of the range
+ *
+ * The range must be within one ftrace record group (the core kernel or one
+ * module). The iterator holds ftrace_lock until it is exhausted or stopped.
+ * Returns the first matching location, or zero if there is no match.
+ */
+unsigned long ftrace_dyn_iter_start(struct ftrace_dyn_iter *iter,
+				    unsigned long start, unsigned long end)
+{
+	struct ftrace_page *pg, *first_pg = NULL;
+	struct dyn_ftrace *rec, *first = NULL;
+
+	iter->active = false;
+	iter->page = NULL;
+	iter->index = 0;
+	iter->start = start;
+	iter->end = end;
+
+	if (start > end)
+		return 0;
+
+	mutex_lock(&ftrace_lock);
+	iter->active = true;
+
+	for (pg = ftrace_pages_start; pg; pg = pg->next) {
+		if (!pg->index)
+			continue;
+
+		rec = lookup_rec_page(pg, start, end);
+		if (rec && (!first || rec->ip < first->ip)) {
+			first = rec;
+			first_pg = pg;
+		}
+	}
+
+	if (!first) {
+		ftrace_dyn_iter_unlock(iter);
+		return 0;
+	}
+
+	iter->page = first_pg;
+	iter->index = first - first_pg->records;
+
+	return first->ip;
+}
+
+/**
+ * ftrace_dyn_iter_next - return the next location in the iterator range
+ * @iter: iterator state
+ *
+ * Returns the next location, or zero when the iterator is exhausted. The
+ * iterator lock is released automatically when exhausted.
+ */
+unsigned long ftrace_dyn_iter_next(struct ftrace_dyn_iter *iter)
+{
+	struct ftrace_page *pg = iter->page;
+	struct dyn_ftrace *rec;
+	unsigned int index = iter->index + 1;
+
+	if (!iter->active)
+		return 0;
+
+	for (; pg; pg = pg->next, index = 0) {
+		for (; index < pg->index; index++) {
+			rec = &pg->records[index];
+			if (rec->ip + MCOUNT_INSN_SIZE <= iter->start)
+				continue;
+			if (rec->ip > iter->end)
+				break;
+
+			iter->page = pg;
+			iter->index = index;
+			return rec->ip;
+		}
+	}
+
+	ftrace_dyn_iter_unlock(iter);
+	return 0;
+}
+
+/**
+ * ftrace_dyn_iter_stop - stop iterating and release the ftrace record lock
+ * @iter: iterator state
+ */
+void ftrace_dyn_iter_stop(struct ftrace_dyn_iter *iter)
+{
+	ftrace_dyn_iter_unlock(iter);
+}
+
 /**
  * ftrace_location_range - return the first address of a traced location
  *	if it touches the given ip range
