@@ -38,23 +38,40 @@ unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr,
 				       struct kprobe *current_kp)
 {
 	struct optimized_kprobe *op;
-	struct kprobe *kp;
+	struct kprobe_addr_iter iter;
+	struct kprobe *kp, *found = NULL;
 	long offs;
-	int i;
 
-	for (i = 0; i < JMP32_INSN_SIZE; i++) {
-		kp = i ? get_kprobe((void *)addr - i) : current_kp;
+	kp = current_kp;
+	if (kp && kprobe_optimized(kp)) {
+		op = container_of(kp, struct optimized_kprobe, kp);
+		/* If op is optimized or under unoptimizing */
+		if (list_empty(&op->list) || optprobe_queued_unopt(op))
+			goto found;
+	}
+	if (!addr)
+		return addr;
+
+	/* Look for an optimized probe overlapping this address. */
+	kprobe_addr_iter_start(&iter,
+			       addr >= JMP32_INSN_SIZE - 1 ?
+			       addr - (JMP32_INSN_SIZE - 1) : 0,
+			       addr - 1);
+	while ((kp = kprobe_addr_iter_next(&iter))) {
 		/* This function only handles jump-optimized kprobe */
-		if (kp && kprobe_optimized(kp)) {
+		if (kprobe_optimized(kp)) {
 			op = container_of(kp, struct optimized_kprobe, kp);
 			/* If op is optimized or under unoptimizing */
 			if (list_empty(&op->list) || optprobe_queued_unopt(op))
-				goto found;
+				found = kp;
 		}
 	}
+	kp = found;
+	if (!kp)
+		return addr;
 
-	return addr;
 found:
+	op = container_of(kp, struct optimized_kprobe, kp);
 	/*
 	 * If the kprobe can be optimized, original bytes which can be
 	 * overwritten by jump destination address. In this case, original
