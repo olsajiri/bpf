@@ -784,16 +784,15 @@ void arch_arm_kprobe(struct kprobe *p)
 {
 	u8 int3 = INT3_INSN_OPCODE;
 
+	if (p->flags & KPROBE_FLAG_BATCH) {
+		smp_text_poke_batch_add(p->addr, &int3, 1, NULL);
+		return;
+	}
+
+	smp_text_poke_batch_finish();
 	text_poke(p->addr, &int3, 1);
 	smp_text_poke_sync_each_cpu();
 	perf_event_text_poke(p->addr, &p->opcode, 1, &int3, 1);
-}
-
-void arch_arm_kprobe_batch(struct kprobe *p)
-{
-	u8 int3 = INT3_INSN_OPCODE;
-
-	smp_text_poke_batch_add(p->addr, &int3, 1, NULL);
 }
 
 void arch_finish_kprobe_batch(void)

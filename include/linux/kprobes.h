@@ -103,6 +103,7 @@ struct kprobe {
 				   */
 #define KPROBE_FLAG_FTRACE	8 /* probe is using ftrace */
 #define KPROBE_FLAG_ON_FUNC_ENTRY	16 /* probe is on the function entry */
+#define KPROBE_FLAG_BATCH	32 /* transient: probe is registered in a batch */
 
 /* Has this kprobe gone ? */
 static inline bool kprobe_gone(struct kprobe *p)
@@ -272,7 +273,6 @@ extern struct kretprobe_blackpoint kretprobe_blacklist[];
 
 extern int arch_prepare_kprobe(struct kprobe *p);
 extern void arch_arm_kprobe(struct kprobe *p);
-extern void arch_arm_kprobe_batch(struct kprobe *p);
 extern void arch_finish_kprobe_batch(void);
 extern void arch_disarm_kprobe(struct kprobe *p);
 extern int arch_init_kprobes(void);

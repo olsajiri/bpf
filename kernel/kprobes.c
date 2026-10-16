@@ -1044,7 +1044,7 @@ static void __init kprobe_sysctls_init(void)
 #endif /* CONFIG_SYSCTL */
 
 /* Put a breakpoint for a probe. */
-static void __arm_kprobe(struct kprobe *p, bool batch)
+static void __arm_kprobe(struct kprobe *p)
 {
 	struct kprobe *_p;
 
@@ -1058,12 +1058,7 @@ static void __arm_kprobe(struct kprobe *p, bool batch)
 		unoptimize_kprobe(_p, true);
 	}
 
-	if (batch)
-		arch_arm_kprobe_batch(p);
-	else {
-		arch_finish_kprobe_batch();
-		arch_arm_kprobe(p);
-	}
+	arch_arm_kprobe(p);
 	optimize_kprobe(p);	/* Try to optimize (add kprobe to a list) */
 }
 
@@ -1106,15 +1101,8 @@ static void __init init_optprobe(void)
 #define kill_optimized_kprobe(p)		do {} while (0)
 #define prepare_optimized_kprobe(p)		do {} while (0)
 #define try_to_optimize_kprobe(p)		do {} while (0)
-#define __arm_kprobe(p, batch) \
-	do { \
-		if (batch) \
-			arch_arm_kprobe_batch(p); \
-		else { \
-			arch_finish_kprobe_batch(); \
-			arch_arm_kprobe(p); \
-		} \
-	} while (0)
+#define __arm_kprobe(p) \
+	arch_arm_kprobe(p)
 #define __disarm_kprobe(p, o)			arch_disarm_kprobe(p)
 #define kprobe_disarmed(p)			kprobe_disabled(p)
 #define wait_for_kprobe_optimizer_locked()			\
@@ -1254,15 +1242,22 @@ static int prepare_kprobe(struct kprobe *p)
 	return arch_prepare_kprobe(p);
 }
 
-static int arm_kprobe(struct kprobe *kp, bool batch)
+static int arm_kprobe(struct kprobe *kp)
 {
-	if (unlikely(kprobe_ftrace(kp)))
-		return arm_kprobe_ftrace(kp);
+	int ret;
 
-	guard(cpus_read_lock)();
-	guard(mutex)(&text_mutex);
-	__arm_kprobe(kp, batch);
-	return 0;
+	if (unlikely(kprobe_ftrace(kp)))
+		ret = arm_kprobe_ftrace(kp);
+	else {
+		guard(cpus_read_lock)();
+		guard(mutex)(&text_mutex);
+		__arm_kprobe(kp);
+		ret = 0;
+	}
+
+	/* The batch flag only controls the initial registration arm. */
+	kp->flags &= ~KPROBE_FLAG_BATCH;
+	return ret;
 }
 
 static int disarm_kprobe(struct kprobe *kp, bool reopt)
@@ -1385,8 +1380,7 @@ static void init_aggr_kprobe(struct kprobe *ap, struct kprobe *p)
 /*
  * This registers the second or subsequent kprobe at the same address.
  */
-static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p,
-				bool batch)
+static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p)
 {
 	int ret = 0;
 	struct kprobe *ap = orig_p;
@@ -1445,7 +1439,9 @@ static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p,
 		ap->flags &= ~KPROBE_FLAG_DISABLED;
 		if (!kprobes_all_disarmed) {
 			/* Arm the breakpoint again. */
-			ret = arm_kprobe(ap, batch);
+			if (p->flags & KPROBE_FLAG_BATCH)
+				ap->flags |= KPROBE_FLAG_BATCH;
+			ret = arm_kprobe(ap);
 			if (ret) {
 				ap->flags |= KPROBE_FLAG_DISABLED;
 				list_del_rcu(&p->list);
@@ -1461,11 +1457,6 @@ bool __weak arch_within_kprobe_blacklist(unsigned long addr)
 	/* The '__kprobes' functions and entry code must not be probed. */
 	return addr >= (unsigned long)__kprobes_text_start &&
 	       addr < (unsigned long)__kprobes_text_end;
-}
-
-void __weak arch_arm_kprobe_batch(struct kprobe *p)
-{
-	arch_arm_kprobe(p);
 }
 
 void __weak arch_finish_kprobe_batch(void)
@@ -1714,7 +1705,7 @@ static int check_kprobe_address_safe(struct kprobe *p,
 	return 0;
 }
 
-static int __register_kprobe(struct kprobe *p, bool batch)
+static int __register_kprobe(struct kprobe *p)
 {
 	int ret;
 	struct kprobe *old_p;
@@ -1724,7 +1715,7 @@ static int __register_kprobe(struct kprobe *p, bool batch)
 	old_p = get_kprobe(p->addr);
 	if (old_p)
 		/* Since this may unoptimize 'old_p', locking 'text_mutex'. */
-		return register_aggr_kprobe(old_p, p, batch);
+		return register_aggr_kprobe(old_p, p);
 
 	scoped_guard(cpus_read_lock) {
 		/* Prevent text modification */
@@ -1739,7 +1730,7 @@ static int __register_kprobe(struct kprobe *p, bool batch)
 		       &kprobe_table[hash_ptr(p->addr, KPROBE_HASH_BITS)]);
 
 	if (!kprobes_all_disarmed && !kprobe_disabled(p)) {
-		ret = arm_kprobe(p, batch);
+		ret = arm_kprobe(p);
 		if (ret) {
 			hlist_del_rcu(&p->hlist);
 			synchronize_rcu();
@@ -1751,12 +1742,15 @@ static int __register_kprobe(struct kprobe *p, bool batch)
 	return 0;
 }
 
-static int register_kprobe_internal(struct kprobe *p, bool batch)
+static int register_kprobe_internal(struct kprobe *p)
 {
 	int ret;
 	struct module *probed_mod;
 	kprobe_opcode_t *addr;
 	bool on_func_entry;
+	bool batch = p->flags & KPROBE_FLAG_BATCH;
+
+	p->flags &= ~KPROBE_FLAG_BATCH;
 
 	/* Canonicalize probe address from symbol */
 	addr = _kprobe_addr(p->addr, p->symbol_name, p->offset, &on_func_entry);
@@ -1770,6 +1764,8 @@ static int register_kprobe_internal(struct kprobe *p, bool batch)
 
 	/* User can pass only KPROBE_FLAG_DISABLED to register_kprobe */
 	p->flags &= KPROBE_FLAG_DISABLED;
+	if (batch)
+		p->flags |= KPROBE_FLAG_BATCH;
 	if (on_func_entry)
 		p->flags |= KPROBE_FLAG_ON_FUNC_ENTRY;
 	p->nmissed = 0;
@@ -1777,19 +1773,22 @@ static int register_kprobe_internal(struct kprobe *p, bool batch)
 
 	ret = check_kprobe_address_safe(p, &probed_mod);
 	if (ret)
-		return ret;
+		goto out;
 
-	ret = __register_kprobe(p, batch);
+	ret = __register_kprobe(p);
 
 	if (probed_mod)
 		module_put(probed_mod);
 
+out:
+	p->flags &= ~KPROBE_FLAG_BATCH;
 	return ret;
 }
 
 int register_kprobe(struct kprobe *p)
 {
-	return register_kprobe_internal(p, false);
+	p->flags &= ~KPROBE_FLAG_BATCH;
+	return register_kprobe_internal(p);
 }
 EXPORT_SYMBOL_GPL(register_kprobe);
 
@@ -1936,7 +1935,8 @@ int register_kprobes(struct kprobe **kps, int num)
 	if (num <= 0)
 		return -EINVAL;
 	for (i = 0; i < num; i++) {
-		ret = register_kprobe_internal(kps[i], true);
+		kps[i]->flags |= KPROBE_FLAG_BATCH;
+		ret = register_kprobe_internal(kps[i]);
 		if (ret < 0) {
 			finish_kprobe_batch();
 			if (i > 0)
@@ -2529,7 +2529,7 @@ int enable_kprobe(struct kprobe *kp)
 
 	if (!kprobes_all_disarmed && kprobe_disabled(p)) {
 		p->flags &= ~KPROBE_FLAG_DISABLED;
-		ret = arm_kprobe(p, false);
+		ret = arm_kprobe(p);
 		if (ret) {
 			p->flags |= KPROBE_FLAG_DISABLED;
 			if (p != kp)
@@ -3007,7 +3007,7 @@ static int arm_all_kprobes(void)
 		/* Arm all kprobes on a best-effort basis */
 		hlist_for_each_entry(p, head, hlist) {
 			if (!kprobe_disabled(p)) {
-				err = arm_kprobe(p, false);
+				err = arm_kprobe(p);
 				if (err)  {
 					errors++;
 					ret = err;
