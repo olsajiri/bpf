@@ -94,13 +94,17 @@ extern void synthesize_relcall(void *dest, void *from, void *to);
 
 #ifdef	CONFIG_OPTPROBES
 extern int setup_detour_execution(struct kprobe *p, struct pt_regs *regs, int reenter);
-extern unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr);
+extern unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf,
+					     unsigned long addr,
+					     struct kprobe *kp);
 #else	/* !CONFIG_OPTPROBES */
 static inline int setup_detour_execution(struct kprobe *p, struct pt_regs *regs, int reenter)
 {
 	return 0;
 }
-static inline unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr)
+static inline unsigned long
+__recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr,
+			 struct kprobe *kp)
 {
 	return addr;
 }
