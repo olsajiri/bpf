@@ -201,11 +201,9 @@ bool can_boost(struct insn *insn, void *addr)
 }
 
 static unsigned long
-__recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr)
+__recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr,
+		      struct kprobe *kp)
 {
-	struct kprobe *kp;
-
-	kp = get_kprobe((void *)addr);
 	/*
 	 * Use the current code if it is not modified by Kprobe
 	 * and it cannot be modified by ftrace.
@@ -252,25 +250,28 @@ __recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr)
 unsigned long recover_probed_instruction(kprobe_opcode_t *buf, unsigned long addr)
 {
 	unsigned long __addr;
+	struct kprobe *kp;
 
-	__addr = __recover_optprobed_insn(buf, addr);
+	kp = get_kprobe((void *)addr);
+	__addr = __recover_optprobed_insn(buf, addr, kp);
 	if (__addr != addr)
 		return __addr;
 
-	return __recover_probed_insn(buf, addr, ftrace_location(addr) == addr);
+	return __recover_probed_insn(buf, addr, ftrace_location(addr) == addr, kp);
 }
 
 static unsigned long
 recover_probed_instruction_with_ftrace(kprobe_opcode_t *buf,
-				       unsigned long addr, bool faddr)
+				       unsigned long addr, bool faddr,
+				       struct kprobe *kp)
 {
 	unsigned long __addr;
 
-	__addr = __recover_optprobed_insn(buf, addr);
+	__addr = __recover_optprobed_insn(buf, addr, kp);
 	if (__addr != addr)
 		return __addr;
 
-	return __recover_probed_insn(buf, addr, faddr);
+	return __recover_probed_insn(buf, addr, faddr, kp);
 }
 
 /* Check if insn is INT or UD */
@@ -301,6 +302,8 @@ static bool can_probe(unsigned long paddr)
 	unsigned long ftrace_ip;
 	struct insn insn;
 	struct ftrace_dyn_iter iter;
+	struct kprobe_addr_iter kiter;
+	struct kprobe *kprobe_ip, *kp;
 	kprobe_opcode_t buf[MAX_INSN_SIZE];
 	bool ret = false;
 
@@ -311,9 +314,14 @@ static bool can_probe(unsigned long paddr)
 	addr = paddr - offset;
 	/* Keep the ftrace records stable while decoding this symbol range. */
 	ftrace_ip = ftrace_dyn_iter_start(&iter, addr, paddr);
+	kprobe_ip = kprobe_addr_iter_start(&kiter, addr, paddr);
 	while (addr < paddr) {
 		while (ftrace_ip && ftrace_ip < addr)
 			ftrace_ip = ftrace_dyn_iter_next(&iter);
+		while (kprobe_ip && (unsigned long)kprobe_ip->addr < addr)
+			kprobe_ip = kprobe_addr_iter_next(&kiter);
+		kp = kprobe_ip && (unsigned long)kprobe_ip->addr == addr ?
+			kprobe_ip : NULL;
 
 		/*
 		 * Check if the instruction has been modified by another
@@ -324,7 +332,7 @@ static bool can_probe(unsigned long paddr)
 		 * normally used, we just go through if there is no kprobe.
 		 */
 		__addr = recover_probed_instruction_with_ftrace(buf, addr,
-								ftrace_ip == addr);
+								ftrace_ip == addr, kp);
 		if (!__addr)
 			goto out_iter;
 
@@ -349,9 +357,12 @@ static bool can_probe(unsigned long paddr)
 
 	while (ftrace_ip && ftrace_ip < addr)
 		ftrace_ip = ftrace_dyn_iter_next(&iter);
+	while (kprobe_ip && (unsigned long)kprobe_ip->addr < addr)
+		kprobe_ip = kprobe_addr_iter_next(&kiter);
+	kp = kprobe_ip && (unsigned long)kprobe_ip->addr == addr ? kprobe_ip : NULL;
 
 	__addr = recover_probed_instruction_with_ftrace(buf, addr,
-								ftrace_ip == addr);
+								ftrace_ip == addr, kp);
 	if (!__addr)
 		goto out_iter;
 
