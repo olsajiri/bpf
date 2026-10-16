@@ -201,13 +201,11 @@ bool can_boost(struct insn *insn, void *addr)
 }
 
 static unsigned long
-__recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr)
+__recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr)
 {
 	struct kprobe *kp;
-	bool faddr;
 
 	kp = get_kprobe((void *)addr);
-	faddr = ftrace_location(addr) == addr;
 	/*
 	 * Use the current code if it is not modified by Kprobe
 	 * and it cannot be modified by ftrace.
@@ -259,7 +257,20 @@ unsigned long recover_probed_instruction(kprobe_opcode_t *buf, unsigned long add
 	if (__addr != addr)
 		return __addr;
 
-	return __recover_probed_insn(buf, addr);
+	return __recover_probed_insn(buf, addr, ftrace_location(addr) == addr);
+}
+
+static unsigned long
+recover_probed_instruction_with_ftrace(kprobe_opcode_t *buf,
+				       unsigned long addr, bool faddr)
+{
+	unsigned long __addr;
+
+	__addr = __recover_optprobed_insn(buf, addr);
+	if (__addr != addr)
+		return __addr;
+
+	return __recover_probed_insn(buf, addr, faddr);
 }
 
 /* Check if insn is INT or UD */
@@ -287,15 +298,23 @@ static inline bool is_exception_insn(struct insn *insn)
 static bool can_probe(unsigned long paddr)
 {
 	unsigned long addr, __addr, offset = 0;
+	unsigned long ftrace_ip;
 	struct insn insn;
+	struct ftrace_dyn_iter iter;
 	kprobe_opcode_t buf[MAX_INSN_SIZE];
+	bool ret = false;
 
 	if (!kallsyms_lookup_size_offset(paddr, NULL, &offset))
 		return false;
 
 	/* Decode instructions */
 	addr = paddr - offset;
+	/* Keep the ftrace records stable while decoding this symbol range. */
+	ftrace_ip = ftrace_dyn_iter_start(&iter, addr, paddr);
 	while (addr < paddr) {
+		while (ftrace_ip && ftrace_ip < addr)
+			ftrace_ip = ftrace_dyn_iter_next(&iter);
+
 		/*
 		 * Check if the instruction has been modified by another
 		 * kprobe, in which case we replace the breakpoint by the
@@ -304,12 +323,13 @@ static bool can_probe(unsigned long paddr)
 		 * relative-jump. Since the relative-jump itself is
 		 * normally used, we just go through if there is no kprobe.
 		 */
-		__addr = recover_probed_instruction(buf, addr);
+		__addr = recover_probed_instruction_with_ftrace(buf, addr,
+								ftrace_ip == addr);
 		if (!__addr)
-			return false;
+			goto out_iter;
 
 		if (insn_decode_kernel(&insn, (void *)__addr) < 0)
-			return false;
+			goto out_iter;
 
 #ifdef CONFIG_KGDB
 		/*
@@ -318,25 +338,29 @@ static bool can_probe(unsigned long paddr)
 		 */
 		if (insn.opcode.bytes[0] == INT3_INSN_OPCODE &&
 		    kgdb_has_hit_break(addr))
-			return false;
+			goto out_iter;
 #endif
 		addr += insn.length;
 	}
 
 	/* Check if paddr is at an instruction boundary */
 	if (addr != paddr)
-		return false;
+		goto out_iter;
 
-	__addr = recover_probed_instruction(buf, addr);
+	while (ftrace_ip && ftrace_ip < addr)
+		ftrace_ip = ftrace_dyn_iter_next(&iter);
+
+	__addr = recover_probed_instruction_with_ftrace(buf, addr,
+								ftrace_ip == addr);
 	if (!__addr)
-		return false;
+		goto out_iter;
 
 	if (insn_decode_kernel(&insn, (void *)__addr) < 0)
-		return false;
+		goto out_iter;
 
 	/* INT and UD are special and should not be kprobed */
 	if (is_exception_insn(&insn))
-		return false;
+		goto out_iter;
 
 	if (IS_ENABLED(CONFIG_CFI)) {
 		/*
@@ -357,15 +381,17 @@ static bool can_probe(unsigned long paddr)
 		else if (insn.opcode.value == 0x3)
 			offset = 6;
 		else
-			goto out;
+			goto out_iter;
 
 		/* This movl/addl is used for decoding CFI. */
 		if (is_cfi_trap(addr + offset))
-			return false;
+			goto out_iter;
 	}
 
-out:
-	return true;
+	ret = true;
+out_iter:
+	ftrace_dyn_iter_stop(&iter);
+	return ret;
 }
 
 /* If x86 supports IBT (ENDBR) it must be skipped. */
