@@ -34,7 +34,8 @@
 
 #include "common.h"
 
-unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr)
+unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr,
+				       struct kprobe *current_kp)
 {
 	struct optimized_kprobe *op;
 	struct kprobe *kp;
@@ -42,7 +43,7 @@ unsigned long __recover_optprobed_insn(kprobe_opcode_t *buf, unsigned long addr)
 	int i;
 
 	for (i = 0; i < JMP32_INSN_SIZE; i++) {
-		kp = get_kprobe((void *)addr - i);
+		kp = i ? get_kprobe((void *)addr - i) : current_kp;
 		/* This function only handles jump-optimized kprobe */
 		if (kp && kprobe_optimized(kp)) {
 			op = container_of(kp, struct optimized_kprobe, kp);
