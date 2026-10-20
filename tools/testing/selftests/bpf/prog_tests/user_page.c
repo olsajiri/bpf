@@ -9,6 +9,8 @@
 
 enum {
 	USER_PAGE_ALLOC = 1,
+	USER_PAGE_EXEC = 2,
+	USER_PAGE_BAD_EXEC = 3,
 };
 
 static noinline int user_page_trigger(void)
@@ -82,6 +84,69 @@ out:
 			munmap(pages[i], page_size * nr_pages);
 }
 
+static void test_partial_exec(struct user_page *skel)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+	long addr = -1;
+
+	if (!alloc_user_pages(skel, 3, &addr))
+		goto out;
+
+	skel->bss->exec_addr = addr + page_size;
+	skel->bss->action = USER_PAGE_BAD_EXEC;
+	if (!ASSERT_EQ(user_page_trigger(), 0, "make_middle_page_exec") ||
+	    !ASSERT_OK(skel->bss->exec_ret, "middle_page_exec_ret") ||
+	    !check_user_page_vma((void *)(addr + page_size), addr + page_size,
+				 page_size, "r-xp") ||
+	    !check_user_page_vma((void *)addr, addr, page_size, "rw-p") ||
+	    !check_user_page_vma((void *)(addr + 2 * page_size),
+				 addr + 2 * page_size, page_size, "rw-p"))
+		goto out;
+
+	skel->bss->exec_addr = addr + 2 * page_size;
+	if (!ASSERT_EQ(user_page_trigger(), 0, "make_last_page_exec") ||
+	    !ASSERT_OK(skel->bss->exec_ret, "last_page_exec_ret"))
+		goto out;
+	check_user_page_vma((void *)(addr + 2 * page_size), addr + 2 * page_size,
+			    page_size, "r-xp");
+out:
+	if (addr >= 0)
+		munmap((void *)addr, page_size * 3);
+}
+
+static void test_read_implies_exec(struct user_page *skel)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+	long addr = -1;
+	int personality_flags;
+	bool restore_personality = false;
+
+	personality_flags = personality(0xffffffff);
+	if (!ASSERT_GE(personality_flags, 0, "get_personality"))
+		goto out;
+	if (personality(personality_flags | READ_IMPLIES_EXEC) == -1) {
+		test__skip();
+		goto out;
+	}
+	restore_personality = true;
+
+	if (!alloc_user_pages(skel, 1, &addr) ||
+	    !check_user_page_vma((void *)addr, addr, page_size, "rwxp"))
+		goto out;
+
+	skel->bss->exec_addr = addr;
+	skel->bss->action = USER_PAGE_BAD_EXEC;
+	if (!ASSERT_EQ(user_page_trigger(), 0, "make_exec") ||
+	    !ASSERT_OK(skel->bss->exec_ret, "exec_ret"))
+		goto out;
+	check_user_page_vma((void *)addr, addr, page_size, "r-xp");
+out:
+	if (restore_personality)
+		ASSERT_GE(personality(personality_flags), 0, "restore_personality");
+	if (addr >= 0)
+		munmap((void *)addr, page_size);
+}
+
 static void test_lazy_allocation(struct user_page *skel)
 {
 	long page_size = sysconf(_SC_PAGESIZE);
@@ -96,6 +161,31 @@ static void test_lazy_allocation(struct user_page *skel)
 	if (!ASSERT_OK(err, "mincore_before_write"))
 		goto out;
 	ASSERT_EQ(vec & 1, 0, "page_not_resident");
+out:
+	if (addr >= 0)
+		munmap((void *)addr, page_size);
+}
+
+static void test_execute_user_page(struct user_page *skel)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+	long addr = -1;
+
+#ifndef __x86_64__
+        test__skip();
+        return;
+#endif
+
+	if (!alloc_user_pages(skel, 1, &addr))
+		goto out;
+
+	skel->bss->exec_addr = addr;
+	skel->bss->action = USER_PAGE_EXEC;
+	if (!ASSERT_EQ(user_page_trigger(), 0, "uprobe_exec") ||
+	    !ASSERT_EQ(skel->bss->write_ret, 0, "exec_write_ret") ||
+	    !ASSERT_EQ(skel->bss->exec_ret, 0, "exec_ret") ||
+	    !ASSERT_EQ(((int (*)(void))addr)(), 42, "execute_user_page"))
+		goto out;
 out:
 	if (addr >= 0)
 		munmap((void *)addr, page_size);
@@ -137,6 +227,12 @@ void test_user_page(void)
 		test_lazy_allocation(skel);
 	if (test__start_subtest("reallocate_after_unmap"))
 		test_reallocate_after_unmap(skel);
+	if (test__start_subtest("partial_exec"))
+		test_partial_exec(skel);
+	if (test__start_subtest("read_implies_exec"))
+		test_read_implies_exec(skel);
+	if (test__start_subtest("execute_user_page"))
+		test_execute_user_page(skel);
 
 out:
 	user_page__destroy(skel);
