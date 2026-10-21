@@ -24,6 +24,17 @@
 #include <linux/namei.h>
 #include "bpf_testmod.h"
 #include "bpf_testmod_kfunc.h"
+#include "bpf_testmod_kprobe_targets.h"
+
+#define BPF_TESTMOD_DECLARE_KPROBE_TARGET(n) \
+	int bpf_testmod_kprobe_target_##n(void);
+BPF_TESTMOD_KPROBE_TARGETS(BPF_TESTMOD_DECLARE_KPROBE_TARGET)
+#undef BPF_TESTMOD_DECLARE_KPROBE_TARGET
+
+#define BPF_TESTMOD_DEFINE_KPROBE_TARGET(n) \
+	noinline int bpf_testmod_kprobe_target_##n(void) { return n; }
+BPF_TESTMOD_KPROBE_TARGETS(BPF_TESTMOD_DEFINE_KPROBE_TARGET)
+#undef BPF_TESTMOD_DEFINE_KPROBE_TARGET
 
 #define CREATE_TRACE_POINTS
 #include "bpf_testmod-events.h"
