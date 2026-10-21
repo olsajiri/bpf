@@ -3782,6 +3782,9 @@ static bool bpf_user_mm_ok(void)
  * @len:  Length of the mapping
  * @prot: PROT_* flags of mmap(2), including PROT_EXEC
  *
+ * This maps memory by calling vm_mmap() directly. It does not invoke the
+ * mmap(2) syscall, so seccomp filters do not mediate this mapping.
+ *
  * Return: The address of the mapping on success, -EPERM if the caller has no
  * user mm, or an unsigned-long encoded negative error code, as returned by
  * vm_mmap().
@@ -3797,6 +3800,9 @@ __bpf_kfunc unsigned long bpf_user_mmap(unsigned long len, unsigned long prot)
  * bpf_user_munmap() - Unmap a range of addresses of the current process
  * @addr: Start of the range
  * @len:  Length of the range
+ *
+ * This unmaps memory by calling vm_munmap() directly. It does not invoke the
+ * munmap(2) syscall, so seccomp filters do not mediate this unmapping.
  *
  * Return: 0 on success, -EPERM if the caller has no user mm, or a negative
  * error code.

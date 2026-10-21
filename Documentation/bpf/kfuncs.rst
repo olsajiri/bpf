@@ -989,3 +989,16 @@ the verifier. bpf_cgroup_ancestor() can be used as follows:
 BPF provides a set of kfuncs that can be used to query, allocate, mutate, and
 destroy struct cpumask * objects. Please refer to :ref:`cpumasks-header-label`
 for more details.
+
+4.4 User memory kfuncs
+----------------------
+
+The user memory kfuncs can create and remove mappings in the current process.
+They call the kernel's mapping functions directly rather than issuing
+``mmap(2)`` or ``munmap(2)`` syscalls. As a result, seccomp filters do not
+mediate these mapping operations. A seccomp filter can still allow or deny the
+syscall that triggers a BPF program, but it cannot separately filter the
+mapping performed by these kfuncs.
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_user_mmap bpf_user_munmap
