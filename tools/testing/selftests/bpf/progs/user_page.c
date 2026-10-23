@@ -8,11 +8,6 @@
 
 char _license[] SEC("license") = "GPL";
 
-extern int bpf_copy_to_user_current(void *dst, const void *src, u32 size,
-				    u64 flags) __ksym;
-extern long bpf_user_mmap(unsigned long len, unsigned long prot) __ksym;
-extern int bpf_user_munmap(unsigned long addr, unsigned long len) __ksym;
-
 enum {
 	USER_MEM_MAP = 1,
 	USER_MEM_COPY = 2,
@@ -42,15 +37,16 @@ int user_page_test(struct pt_regs *ctx)
 		user_addr = bpf_user_mmap(map_len, map_prot);
 		break;
 	case USER_MEM_COPY:
-		op_ret = bpf_copy_to_user_current((void *)user_addr, data,
-						  sizeof(data), 0);
+		op_ret = bpf_copy_to_user_task((void *)user_addr, data, sizeof(data),
+					       bpf_get_current_task_btf(), 0);
 		break;
 	case USER_MEM_BAD_COPY:
-		op_ret = bpf_copy_to_user_current((void *)1, data, sizeof(data), 0);
+		op_ret = bpf_copy_to_user_task((void *)1, data, sizeof(data),
+					       bpf_get_current_task_btf(), 0);
 		break;
 	case USER_MEM_BAD_COPY_FLAGS:
-		op_ret = bpf_copy_to_user_current((void *)user_addr, data,
-						  sizeof(data), copy_flags);
+		op_ret = bpf_copy_to_user_task((void *)user_addr, data, sizeof(data),
+					       bpf_get_current_task_btf(), copy_flags);
 		break;
 	case USER_MEM_UNMAP:
 		op_ret = bpf_user_munmap(user_addr, map_len);
