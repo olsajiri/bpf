@@ -413,12 +413,15 @@ kprobe_opcode_t *arch_adjust_kprobe_addr(unsigned long addr, unsigned long offse
  * instruction, displacement must be adjust by @real, not @dest.
  * This returns the length of copied instruction, or 0 if it has an error.
  */
-int __copy_instruction(u8 *dest, u8 *src, u8 *real, struct insn *insn)
+int __copy_instruction(u8 *dest, u8 *src, u8 *real, struct insn *insn,
+		       struct kprobe *kp)
 {
 	kprobe_opcode_t buf[MAX_INSN_SIZE];
-	unsigned long recovered_insn = recover_probed_instruction(buf, (unsigned long)src);
+	unsigned long recovered_insn;
 	int ret;
 
+	recovered_insn = recover_probed_instruction_with_kprobe(buf,
+								(unsigned long)src, kp);
 	if (!recovered_insn || !insn)
 		return 0;
 
@@ -753,7 +756,8 @@ static int arch_copy_kprobe(struct kprobe *p)
 	int ret, len;
 
 	/* Copy an instruction with recovering if other optprobe modifies it.*/
-	len = __copy_instruction(buf, p->addr, p->ainsn.insn, &insn);
+	len = __copy_instruction(buf, p->addr, p->ainsn.insn, &insn,
+				 get_kprobe(p->addr));
 	if (!len)
 		return -EINVAL;
 
