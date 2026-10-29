@@ -247,17 +247,23 @@ __recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr,
  * for preventing to release referencing kprobes.
  * Returns zero if the instruction can not get recovered (or access failed).
  */
-unsigned long recover_probed_instruction(kprobe_opcode_t *buf, unsigned long addr)
+unsigned long
+recover_probed_instruction_with_kprobe(kprobe_opcode_t *buf,
+				       unsigned long addr, struct kprobe *kp)
 {
 	unsigned long __addr;
-	struct kprobe *kp;
 
-	kp = get_kprobe((void *)addr);
 	__addr = __recover_optprobed_insn(buf, addr, kp);
 	if (__addr != addr)
 		return __addr;
 
 	return __recover_probed_insn(buf, addr, ftrace_location(addr) == addr, kp);
+}
+
+unsigned long recover_probed_instruction(kprobe_opcode_t *buf, unsigned long addr)
+{
+	return recover_probed_instruction_with_kprobe(buf, addr,
+						      get_kprobe((void *)addr));
 }
 
 /* Check if insn is INT or UD */

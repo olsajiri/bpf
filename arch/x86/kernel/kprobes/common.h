@@ -82,6 +82,10 @@ extern bool can_boost(struct insn *insn, void *orig_addr);
 /* Recover instruction if given address is probed */
 extern unsigned long recover_probed_instruction(kprobe_opcode_t *buf,
 					 unsigned long addr);
+extern unsigned long
+recover_probed_instruction_with_kprobe(kprobe_opcode_t *buf,
+					       unsigned long addr,
+					       struct kprobe *kp);
 /*
  * Copy an instruction and adjust the displacement if the instruction
  * uses the %rip-relative addressing mode.
