@@ -201,13 +201,9 @@ bool can_boost(struct insn *insn, void *addr)
 }
 
 static unsigned long
-__recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr)
+__recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr,
+		      struct kprobe *kp)
 {
-	struct kprobe *kp;
-	bool faddr;
-
-	kp = get_kprobe((void *)addr);
-	faddr = ftrace_location(addr) == addr;
 	/*
 	 * Use the current code if it is not modified by Kprobe
 	 * and it cannot be modified by ftrace.
@@ -254,12 +250,14 @@ __recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr)
 unsigned long recover_probed_instruction(kprobe_opcode_t *buf, unsigned long addr)
 {
 	unsigned long __addr;
+	struct kprobe *kp;
 
-	__addr = __recover_optprobed_insn(buf, addr);
+	kp = get_kprobe((void *)addr);
+	__addr = __recover_optprobed_insn(buf, addr, kp);
 	if (__addr != addr)
 		return __addr;
 
-	return __recover_probed_insn(buf, addr);
+	return __recover_probed_insn(buf, addr, ftrace_location(addr) == addr, kp);
 }
 
 /* Check if insn is INT or UD */
@@ -288,6 +286,8 @@ static bool can_probe(unsigned long paddr)
 {
 	unsigned long addr, __addr, offset = 0;
 	struct insn insn;
+	struct kprobe_addr_iter kiter;
+	struct kprobe *kprobe_ip, *kp;
 	kprobe_opcode_t buf[MAX_INSN_SIZE];
 
 	if (!kallsyms_lookup_size_offset(paddr, NULL, &offset))
@@ -295,7 +295,12 @@ static bool can_probe(unsigned long paddr)
 
 	/* Decode instructions */
 	addr = paddr - offset;
+	kprobe_ip = kprobe_addr_iter_start(&kiter, addr, paddr);
 	while (addr < paddr) {
+		while (kprobe_ip && (unsigned long)kprobe_ip->addr < addr)
+			kprobe_ip = kprobe_addr_iter_next(&kiter);
+		kp = kprobe_ip && (unsigned long)kprobe_ip->addr == addr ?
+			kprobe_ip : NULL;
 		/*
 		 * Check if the instruction has been modified by another
 		 * kprobe, in which case we replace the breakpoint by the
@@ -304,7 +309,11 @@ static bool can_probe(unsigned long paddr)
 		 * relative-jump. Since the relative-jump itself is
 		 * normally used, we just go through if there is no kprobe.
 		 */
-		__addr = recover_probed_instruction(buf, addr);
+		__addr = __recover_optprobed_insn(buf, addr, kp);
+		if (__addr == addr)
+			__addr = __recover_probed_insn(buf, addr,
+						      ftrace_location(addr) == addr,
+						      kp);
 		if (!__addr)
 			return false;
 
@@ -327,7 +336,14 @@ static bool can_probe(unsigned long paddr)
 	if (addr != paddr)
 		return false;
 
-	__addr = recover_probed_instruction(buf, addr);
+	while (kprobe_ip && (unsigned long)kprobe_ip->addr < addr)
+		kprobe_ip = kprobe_addr_iter_next(&kiter);
+	kp = kprobe_ip && (unsigned long)kprobe_ip->addr == addr ? kprobe_ip : NULL;
+
+	__addr = __recover_optprobed_insn(buf, addr, kp);
+	if (__addr == addr)
+		__addr = __recover_probed_insn(buf, addr,
+					      ftrace_location(addr) == addr, kp);
 	if (!__addr)
 		return false;
 
