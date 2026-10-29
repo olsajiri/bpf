@@ -223,10 +223,21 @@ NOKPROBE_SYMBOL(optimized_callback);
 static int copy_optimized_instructions(u8 *dest, u8 *src, u8 *real)
 {
 	struct insn insn;
+	struct kprobe_addr_iter iter;
+	struct kprobe *kprobe_ip, *kp;
 	int len = 0, ret;
 
+	kprobe_ip = kprobe_addr_iter_start(&iter, (unsigned long)src,
+					   (unsigned long)src +
+					   JMP32_INSN_SIZE - 1);
 	while (len < JMP32_INSN_SIZE) {
-		ret = __copy_instruction(dest + len, src + len, real + len, &insn);
+		while (kprobe_ip && (unsigned long)kprobe_ip->addr <
+		       (unsigned long)src + len)
+			kprobe_ip = kprobe_addr_iter_next(&iter);
+		kp = kprobe_ip && (unsigned long)kprobe_ip->addr ==
+			(unsigned long)src + len ? kprobe_ip : NULL;
+		ret = __copy_instruction(dest + len, src + len, real + len, &insn,
+					 kp);
 		if (!ret || !can_boost(&insn, src + len))
 			return -EINVAL;
 		len += ret;
