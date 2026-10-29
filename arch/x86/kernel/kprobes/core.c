@@ -243,8 +243,8 @@ __recover_probed_insn(kprobe_opcode_t *buf, unsigned long addr, bool faddr,
 
 /*
  * Recover the probed instruction at addr for further analysis.
- * Caller must lock kprobes by kprobe_mutex, or disable preemption
- * for preventing to release referencing kprobes.
+ * Caller must hold kprobe_mutex to protect referenced kprobes and the
+ * address tree.
  * Returns zero if the instruction can not get recovered (or access failed).
  */
 unsigned long
