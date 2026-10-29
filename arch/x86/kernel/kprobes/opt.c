@@ -259,8 +259,10 @@ static int insn_jump_into_range(struct insn *insn, unsigned long start, int len)
 /* Decode whole function to ensure any instructions don't jump into target */
 static int can_optimize(unsigned long paddr)
 {
-	unsigned long addr, size = 0, offset = 0;
+	unsigned long addr, end, size = 0, offset = 0;
 	struct insn insn;
+	struct kprobe_addr_iter kiter;
+	struct kprobe *kprobe_ip, *kp;
 	kprobe_opcode_t buf[MAX_INSN_SIZE];
 
 	/* Lookup symbol including addr */
@@ -281,9 +283,16 @@ static int can_optimize(unsigned long paddr)
 
 	/* Decode instructions */
 	addr = paddr - offset;
-	while (addr < paddr - offset + size) { /* Decode until function end */
+	end = addr + size;
+	kprobe_ip = kprobe_addr_iter_start(&kiter, addr, end);
+	while (addr < end) { /* Decode until function end */
 		unsigned long recovered_insn;
 		int ret;
+
+		while (kprobe_ip && (unsigned long)kprobe_ip->addr < addr)
+			kprobe_ip = kprobe_addr_iter_next(&kiter);
+		kp = kprobe_ip && (unsigned long)kprobe_ip->addr == addr ?
+			kprobe_ip : NULL;
 
 		if (search_exception_tables(addr))
 			/*
@@ -291,7 +300,7 @@ static int can_optimize(unsigned long paddr)
 			 * we can't optimize kprobe in this function.
 			 */
 			return 0;
-		recovered_insn = recover_probed_instruction(buf, addr);
+		recovered_insn = recover_probed_instruction_with_kprobe(buf, addr, kp);
 		if (!recovered_insn)
 			return 0;
 
