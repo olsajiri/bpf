@@ -32,6 +32,9 @@
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/limits.h>
+#ifdef CONFIG_X86_64
+#include <asm/thread_info.h>
+#endif
 
 #include "../../lib/kstrtox.h"
 
@@ -3781,6 +3784,27 @@ static bool bpf_user_mm_ok(void)
 	return current->mm && !(current->flags & (PF_KTHREAD | PF_EXITING));
 }
 
+#ifdef CONFIG_X86_64
+static unsigned long bpf_user_vm_mmap(unsigned long len, unsigned long prot)
+{
+	struct thread_info *ti = current_thread_info();
+	bool compat = test_thread_flag(TIF_ADDR32);
+	unsigned long addr;
+
+	if (compat)
+		ti->status |= TS_COMPAT;
+	addr = vm_mmap(NULL, 0, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+	if (compat)
+		ti->status &= ~TS_COMPAT;
+	return addr;
+}
+#else
+static unsigned long bpf_user_vm_mmap(unsigned long len, unsigned long prot)
+{
+	return vm_mmap(NULL, 0, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+}
+#endif
+
 /**
  * bpf_user_mmap() - Map private anonymous memory into the current process
  * @len:  Length of the mapping
@@ -3797,7 +3821,7 @@ __bpf_kfunc unsigned long bpf_user_mmap(unsigned long len, unsigned long prot)
 {
 	if (!bpf_user_mm_ok())
 		return -EPERM;
-	return vm_mmap(NULL, 0, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, 0);
+	return bpf_user_vm_mmap(len, prot);
 }
 
 /**
