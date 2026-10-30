@@ -300,6 +300,16 @@ static void test_invalid_copy(struct user_mem *skel)
 	ASSERT_EQ(user_mem_copy(skel, 1, 0, 1), -EINVAL, "zero_length_copy_bad_flags");
 }
 
+static void test_invalid_prot(struct user_mem *skel)
+{
+	skel->bss->map_len = page_size;
+	skel->bss->map_prot = 0x80000000;
+	skel->bss->action = USER_MEM_MMAP;
+	user_mem_trigger();
+
+	ASSERT_EQ(skel->bss->user_addr, -EINVAL, "invalid_prot");
+}
+
 void test_user_mem(void)
 {
 	struct user_mem *skel;
@@ -330,6 +340,8 @@ void test_user_mem(void)
 		test_failed_unmap(skel);
 	if (test__start_subtest("invalid_copy"))
 		test_invalid_copy(skel);
+	if (test__start_subtest("invalid_prot"))
+		test_invalid_prot(skel);
 	if (test__start_subtest("zero_length_mapping"))
 		test_zero_length_mapping(skel);
 

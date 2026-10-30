@@ -3821,6 +3821,8 @@ __bpf_kfunc unsigned long bpf_user_mmap(unsigned long len, unsigned long prot)
 {
 	if (!bpf_user_mm_ok())
 		return -EPERM;
+	if (!arch_validate_prot(prot, 0))
+		return -EINVAL;
 	return bpf_user_vm_mmap(len, prot);
 }
 
