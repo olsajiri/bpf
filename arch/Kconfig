@@ -1696,6 +1696,7 @@ config HAVE_STATIC_CALL_INLINE
 	bool
 	depends on HAVE_STATIC_CALL
 	select OBJTOOL
+	select SITE_INDEX
 
 config ARCH_WANT_LD_ORPHAN_WARN
 	bool

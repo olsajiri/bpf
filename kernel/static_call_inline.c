@@ -8,12 +8,19 @@
 #include <linux/module.h>
 #include <linux/cpu.h>
 #include <linux/processor.h>
+#include <linux/site_index.h>
 #include <asm/sections.h>
 
 extern struct static_call_site __start_static_call_sites[],
 			       __stop_static_call_sites[];
 extern struct static_call_tramp_key __start_static_call_tramp_key[],
 				    __stop_static_call_tramp_key[];
+
+/*
+ * Index static call sites by code address for text reservation lookups.
+ * The site table itself is sorted by static-call-key address.
+ */
+static struct site_index *static_call_site_index;
 
 int static_call_initialized;
 
@@ -41,7 +48,7 @@ static void static_call_unlock(void)
 	mutex_unlock(&static_call_mutex);
 }
 
-static inline void *static_call_addr(struct static_call_site *site)
+static inline void *static_call_addr(const struct static_call_site *site)
 {
 	return (void *)((long)site->addr + (long)&site->addr);
 }
@@ -301,6 +308,41 @@ static int addr_conflict(struct static_call_site *site, void *start, void *end)
 	return 0;
 }
 
+static unsigned long static_call_site_index_addr(const void *site)
+{
+	return (unsigned long)static_call_addr(site);
+}
+
+static struct site_index *
+static_call_site_index_alloc(struct static_call_site *start,
+			     struct static_call_site *stop)
+{
+	return site_index_alloc(start, sizeof(*start), stop - start,
+				static_call_site_index_addr);
+}
+
+static int
+static_call_site_index_text_reserved(struct site_index *index,
+				     void *start, void *end, bool init)
+{
+	unsigned int i;
+
+	for (i = site_index_find(index, (unsigned long)start,
+				 static_call_site_index_addr);
+	     i < index->nr; i++) {
+		struct static_call_site *site = index->entries[i];
+
+		/* Later sites cannot overlap once this address is past @end. */
+		if (static_call_addr(site) > end)
+			break;
+		if ((init || !static_call_is_init(site)) &&
+		    addr_conflict(site, start, end))
+			return 1;
+	}
+
+	return 0;
+}
+
 static int __static_call_text_reserved(struct static_call_site *iter_start,
 				       struct static_call_site *iter_stop,
 				       void *start, void *end, bool init)
@@ -322,11 +364,13 @@ static int __static_call_text_reserved(struct static_call_site *iter_start,
 
 static int __static_call_mod_text_reserved(void *start, void *end)
 {
+	struct site_index *index;
 	struct module *mod;
+	bool init;
 
 	/*
-	 * Module memory is freed only after synchronize_rcu(), so RCU keeps
-	 * the module and its sites alive for the whole lookup.
+	 * RCU keeps both the module (freed after synchronize_rcu()) and its
+	 * site index (freed with kvfree_rcu()) alive for the whole lookup.
 	 */
 	guard(rcu)();
 
@@ -335,9 +379,14 @@ static int __static_call_mod_text_reserved(void *start, void *end)
 	if (!mod)
 		return 0;
 
+	init = mod->state == MODULE_STATE_COMING;
+	index = rcu_dereference(mod->static_call_site_index);
+	if (index)
+		return static_call_site_index_text_reserved(index, start, end, init);
+
 	return __static_call_text_reserved(mod->static_call_sites,
 			mod->static_call_sites + mod->num_static_call_sites,
-			start, end, mod->state == MODULE_STATE_COMING);
+			start, end, init);
 }
 
 static unsigned long tramp_key_lookup(unsigned long addr)
@@ -361,7 +410,9 @@ static int static_call_add_module(struct module *mod)
 {
 	struct static_call_site *start = mod->static_call_sites;
 	struct static_call_site *stop = start + mod->num_static_call_sites;
+	struct site_index *index;
 	struct static_call_site *site;
+	int ret;
 
 	for (site = start; site != stop; site++) {
 		unsigned long s_key = __static_call_key(site);
@@ -393,7 +444,16 @@ static int static_call_add_module(struct module *mod)
 		site->key = key - (long)&site->key;
 	}
 
-	return __static_call_init(mod, start, stop);
+	ret = __static_call_init(mod, start, stop);
+	if (ret)
+		return ret;
+
+	/* Build after initialization has sorted the site table by key. */
+	index = static_call_site_index_alloc(start, stop);
+	/* Allocation failure leaves reservation checks using the linear scan. */
+	rcu_assign_pointer(mod->static_call_site_index, index);
+
+	return 0;
 }
 
 static void static_call_del_module(struct module *mod)
@@ -402,8 +462,16 @@ static void static_call_del_module(struct module *mod)
 	struct static_call_site *stop = mod->static_call_sites +
 					mod->num_static_call_sites;
 	struct static_call_key *key, *prev_key = NULL;
+	struct site_index *index;
 	struct static_call_mod *site_mod, **prev;
 	struct static_call_site *site;
+
+	/* Reservation lookups walk the index under RCU. */
+	index = rcu_dereference_protected(mod->static_call_site_index,
+					  lockdep_is_held(&static_call_mutex));
+	RCU_INIT_POINTER(mod->static_call_site_index, NULL);
+	if (index)
+		kvfree_rcu(index, rcu);
 
 	for (site = start; site < stop; site++) {
 		key = static_call_key(site);
@@ -480,7 +548,15 @@ static inline int __static_call_mod_text_reserved(void *start, void *end)
 int static_call_text_reserved(void *start, void *end)
 {
 	bool init = system_state < SYSTEM_RUNNING;
-	int ret = __static_call_text_reserved(__start_static_call_sites,
+	struct site_index *index;
+	int ret;
+
+	/* Pairs with the release in static_call_site_index_build(). */
+	index = smp_load_acquire(&static_call_site_index);
+	if (index)
+		ret = static_call_site_index_text_reserved(index, start, end, init);
+	else
+		ret = __static_call_text_reserved(__start_static_call_sites,
 			__stop_static_call_sites, start, end, init);
 
 	if (ret)
@@ -518,6 +594,23 @@ int __init static_call_init(void)
 	return 0;
 }
 early_initcall(static_call_init);
+
+static int __init static_call_site_index_build(void)
+{
+	struct site_index *index;
+
+	/*
+	 * Build the index in an initcall so normal memory allocation is
+	 * available, static_call_init() can run before that.
+	 */
+	index = static_call_site_index_alloc(__start_static_call_sites,
+					     __stop_static_call_sites);
+
+	/* Publish the initialized index to static_call_text_reserved(). */
+	smp_store_release(&static_call_site_index, index);
+	return 0;
+}
+late_initcall(static_call_site_index_build);
 
 #ifdef CONFIG_STATIC_CALL_SELFTEST
 

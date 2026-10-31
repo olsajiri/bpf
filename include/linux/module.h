@@ -535,6 +535,7 @@ struct module {
 #ifdef CONFIG_HAVE_STATIC_CALL_INLINE
 	int num_static_call_sites;
 	struct static_call_site *static_call_sites;
+	struct site_index __rcu *static_call_site_index;
 #endif
 #if IS_ENABLED(CONFIG_KUNIT)
 	int num_kunit_init_suites;
