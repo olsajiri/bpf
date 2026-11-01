@@ -97,6 +97,7 @@ struct kprobe {
 
 struct kprobe_iter {
 	struct kprobe *next;
+	struct kprobe *addr_kp;
 	unsigned long end;
 };
 
@@ -398,6 +399,15 @@ struct kprobe *kprobe_iter_next(struct kprobe_iter *iter);
 #define for_each_kprobe(iter, p, start, end)			\
 	for ((p) = kprobe_iter_start(&(iter), (start), (end));	\
 	     (p); (p) = kprobe_iter_next(&(iter)))
+
+struct kprobe * kprobe_addr_iter_start(struct kprobe_iter *iter, unsigned long start,
+				       unsigned long end);
+struct kprobe * kprobe_addr_iter_next(struct kprobe_iter *iter, unsigned long addr);
+
+#define for_each_kprobe_addr(iter, p, addr, end)			\
+	for ((p) = kprobe_addr_iter_start(&(iter), (addr), (end));	\
+	     (addr) < (end);						\
+	     (p) = kprobe_addr_iter_next(&(iter), (addr)))
 
 /* kprobe_running() will just return the current_kprobe on this CPU */
 static inline struct kprobe *kprobe_running(void)

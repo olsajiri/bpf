@@ -478,6 +478,31 @@ struct kprobe *kprobe_iter_next(struct kprobe_iter *iter)
 	return kp;
 }
 
+struct kprobe *kprobe_addr_iter_start(struct kprobe_iter *iter, unsigned long start,
+				      unsigned long end)
+{
+	struct kprobe *kp;
+
+	iter->addr_kp = NULL;
+	if (start >= end) {
+		iter->next = NULL;
+		return NULL;
+	}
+
+	kp = kprobe_iter_start(iter, start, end - 1);
+	iter->addr_kp = kp;
+	return kp && (unsigned long)kp->addr == start ? kp : NULL;
+}
+
+struct kprobe *kprobe_addr_iter_next(struct kprobe_iter *iter, unsigned long addr)
+{
+	while (iter->addr_kp && (unsigned long)iter->addr_kp->addr < addr)
+		iter->addr_kp = kprobe_iter_next(iter);
+
+	return iter->addr_kp && (unsigned long)iter->addr_kp->addr == addr ?
+	       iter->addr_kp : NULL;
+}
+
 static int aggr_pre_handler(struct kprobe *p, struct pt_regs *regs);
 
 /* Return true if 'p' is an aggregator */
