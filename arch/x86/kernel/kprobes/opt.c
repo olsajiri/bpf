@@ -289,7 +289,7 @@ static int can_optimize(unsigned long paddr)
 			 * we can't optimize kprobe in this function.
 			 */
 			return 0;
-		recovered_insn = recover_probed_instruction(buf, addr);
+		recovered_insn = recover_probed_instruction(buf, addr, NULL);
 		if (!recovered_insn)
 			return 0;
 
