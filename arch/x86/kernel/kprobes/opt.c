@@ -352,12 +352,15 @@ static int can_optimize(unsigned long paddr)
 /* Check optimized_kprobe can actually be optimized. */
 int arch_check_optimized_kprobe(struct optimized_kprobe *op)
 {
-	int i;
+	struct kprobe_iter iter;
 	struct kprobe *p;
 
-	for (i = 1; i < op->optinsn.size; i++) {
-		p = get_kprobe(op->kp.addr + i);
-		if (p && !kprobe_disarmed(p))
+	if (op->optinsn.size <= 1)
+		return 0;
+
+	for_each_kprobe(iter, p, (unsigned long)op->kp.addr + 1,
+			 (unsigned long)op->kp.addr + op->optinsn.size - 1) {
+		if (!kprobe_disarmed(p))
 			return -EEXIST;
 	}
 
