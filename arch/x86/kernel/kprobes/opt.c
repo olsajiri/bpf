@@ -254,10 +254,22 @@ static int insn_jump_into_range(struct insn *insn, unsigned long start, int len)
 	return (start <= target && target <= start + len);
 }
 
+static struct kprobe *
+get_kprobe_for_addr(unsigned long addr, struct kprobe **kpip, struct kprobe_iter *iter)
+{
+	struct kprobe *kpi = *kpip;
+
+	while (kpi && addr > (unsigned long)kpi->addr)
+		*kpip = kpi = kprobe_iter_next(iter);
+	return kpi && addr == (unsigned long)kpi->addr ? kpi : NULL;
+}
+
 /* Decode whole function to ensure any instructions don't jump into target */
 static int can_optimize(unsigned long paddr)
 {
-	unsigned long addr, size = 0, offset = 0;
+	unsigned long addr, end, size = 0, offset = 0;
+	struct kprobe_iter iter;
+	struct kprobe *kpi;
 	struct insn insn;
 	kprobe_opcode_t buf[MAX_INSN_SIZE];
 
@@ -277,10 +289,15 @@ static int can_optimize(unsigned long paddr)
 	if (size - offset < JMP32_INSN_SIZE)
 		return 0;
 
+
 	/* Decode instructions */
 	addr = paddr - offset;
-	while (addr < paddr - offset + size) { /* Decode until function end */
+	end = paddr - offset + size;
+	kpi = kprobe_iter_start(&iter, addr, end);
+
+	while (addr < end) { /* Decode until function end */
 		unsigned long recovered_insn;
+		struct kprobe *kp;
 		int ret;
 
 		if (search_exception_tables(addr))
@@ -289,7 +306,8 @@ static int can_optimize(unsigned long paddr)
 			 * we can't optimize kprobe in this function.
 			 */
 			return 0;
-		recovered_insn = recover_probed_instruction(buf, addr);
+		kp = get_kprobe_for_addr(addr, &kpi, &iter);
+		recovered_insn = recover_probed_instruction(buf, addr, &kp);
 		if (!recovered_insn)
 			return 0;
 
