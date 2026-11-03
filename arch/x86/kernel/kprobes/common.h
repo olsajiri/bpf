@@ -79,6 +79,8 @@
 
 /* Ensure if the instruction can be boostable */
 extern bool can_boost(struct insn *insn, void *orig_addr);
+struct kprobe *get_kprobe_for_addr(unsigned long addr, struct kprobe **kpip,
+				   struct kprobe_iter *iter);
 /* Recover instruction; @kp is NULL if the caller needs a kprobe lookup. */
 extern unsigned long recover_probed_instruction(kprobe_opcode_t *buf,
 						 unsigned long addr, struct kprobe **kp);

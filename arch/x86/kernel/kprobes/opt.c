@@ -254,7 +254,7 @@ static int insn_jump_into_range(struct insn *insn, unsigned long start, int len)
 	return (start <= target && target <= start + len);
 }
 
-static struct kprobe *
+struct kprobe *
 get_kprobe_for_addr(unsigned long addr, struct kprobe **kpip, struct kprobe_iter *iter)
 {
 	struct kprobe *kpi = *kpip;
