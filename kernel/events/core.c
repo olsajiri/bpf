@@ -11856,6 +11856,10 @@ static int __perf_event_set_bpf_prog(struct perf_event *event,
 	if (prog->aux->kprobe_write_ctx && !is_uprobe)
 		return -EINVAL;
 
+	/* PERF_EVENT_IOC_SET_BPF also accepts kprobe.multi progs. */
+	if (prog->aux->jits_use_priv_stack && is_uprobe)
+		return -EINVAL;
+
 	if (is_tracepoint || is_syscall_tp) {
 		int off = trace_event_get_offsets(event->tp_event);
 
