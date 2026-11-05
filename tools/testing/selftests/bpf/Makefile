@@ -63,6 +63,10 @@ TEST_GEN_PROGS_EXTENDED = \
 
 TEST_GEN_FILES += $(TEST_KMODS) liburandom_read.so urandom_read sign-file uprobe_multi
 
+ifeq ($(SRCARCH),x86)
+TEST_GEN_FILES += user_mem_ia32
+endif
+
 ifneq ($(V),1)
 submake_extras := feature_display=0
 endif
@@ -227,6 +231,11 @@ $(TEST_KMOD_TARGETS): $(addprefix test_kmods/,$(TEST_KMODS))
 	$(Q)$(if $(PERMISSIVE),if [ -f test_kmods/$(@F) ]; then )cp test_kmods/$(@F) $@$(if $(PERMISSIVE),; fi)
 
 $(TEST_GEN_PROGS) $(TEST_GEN_PROGS_EXTENDED): $(BPFOBJ)
+
+ifeq ($(SRCARCH),x86)
+$(OUTPUT)/user_mem_ia32: user_mem_ia32.S
+	$(CC) -m32 -nostdlib -no-pie -Wl,-m,elf_i386 -o $@ $<
+endif
 
 TESTING_HELPERS	:= $(OUTPUT)/testing_helpers.o
 CGROUP_HELPERS	:= $(OUTPUT)/cgroup_helpers.o

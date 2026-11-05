@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <test_progs.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -309,6 +312,117 @@ static void test_invalid_prot(struct user_mem *skel)
 	ASSERT_EQ(skel->bss->user_addr, -EINVAL, "invalid_prot");
 }
 
+static void test_ia32_mmap(struct user_mem *skel)
+{
+	struct bpf_uprobe_opts opts = {
+		.sz = sizeof(opts),
+		.func_name = "user_mem_trigger",
+	};
+	struct bpf_link *link = NULL;
+	char helper_path[PATH_MAX];
+	int trigger_pipe[2] = { -1, -1 };
+	int exec_pipe[2] = { -1, -1 };
+	int exec_err = 0, status;
+	long page_size = sysconf(_SC_PAGESIZE);
+	unsigned long addr;
+	ssize_t n;
+	pid_t child = -1;
+	char trigger = 1;
+
+#if !defined(__x86_64__)
+	test__skip();
+	return;
+#endif
+	if (!ASSERT_OK(access("user_mem_ia32", X_OK), "ia32_helper"))
+		return;
+	if (!ASSERT_TRUE(realpath("user_mem_ia32", helper_path), "realpath"))
+		return;
+	if (!ASSERT_OK(pipe2(trigger_pipe, O_CLOEXEC), "trigger_pipe"))
+		goto out;
+	if (!ASSERT_OK(pipe2(exec_pipe, O_CLOEXEC), "exec_pipe"))
+		goto out;
+
+	child = fork();
+	if (!child) {
+		close(trigger_pipe[1]);
+		close(exec_pipe[0]);
+		if (dup2(trigger_pipe[0], STDIN_FILENO) < 0)
+			goto exec_fail;
+		close(trigger_pipe[0]);
+		execl(helper_path, helper_path, NULL);
+exec_fail:
+		exec_err = errno;
+		write(exec_pipe[1], &exec_err, sizeof(exec_err));
+		_exit(127);
+	}
+	if (!ASSERT_GT(child, 0, "fork"))
+		goto out;
+
+	close(trigger_pipe[0]);
+	trigger_pipe[0] = -1;
+	close(exec_pipe[1]);
+	exec_pipe[1] = -1;
+	do {
+		n = read(exec_pipe[0], &exec_err, sizeof(exec_err));
+	} while (n < 0 && errno == EINTR);
+	if (n == sizeof(exec_err)) {
+		if (exec_err == ENOEXEC) {
+			test__skip();
+			goto out;
+		}
+		ASSERT_EQ(exec_err, 0, "exec_ia32");
+		goto out;
+	}
+	if (!ASSERT_EQ(n, 0, "exec_ia32"))
+		goto out;
+	close(exec_pipe[0]);
+	exec_pipe[0] = -1;
+
+	link = bpf_program__attach_uprobe_opts(skel->progs.user_mem_test, child,
+					       helper_path, 0, &opts);
+	if (!ASSERT_OK_PTR(link, "attach_ia32_uprobe")) {
+		link = NULL;
+		goto out;
+	}
+
+	skel->bss->monitored_pid = child;
+	skel->bss->map_len = page_size;
+	skel->bss->map_prot = PROT_READ | PROT_WRITE;
+	skel->bss->action = USER_MEM_MMAP;
+	skel->bss->user_addr = ~0UL;
+	if (!ASSERT_EQ(write(trigger_pipe[1], &trigger, sizeof(trigger)),
+		       sizeof(trigger), "trigger_ia32"))
+		goto out;
+	close(trigger_pipe[1]);
+	trigger_pipe[1] = -1;
+	if (!ASSERT_EQ(waitpid(child, &status, 0), child, "wait_ia32"))
+		goto out;
+	child = -1;
+	if (!ASSERT_TRUE(WIFEXITED(status), "ia32_exit"))
+		goto out;
+	if (!ASSERT_EQ(WEXITSTATUS(status), 0, "ia32_exit_status"))
+		goto out;
+
+	addr = skel->bss->user_addr;
+	if (!ASSERT_LT(addr, -4095UL, "ia32_user_addr"))
+		goto out;
+	ASSERT_LE(addr, 0xffffffffUL, "ia32_address_limit");
+out:
+	if (link)
+		bpf_link__destroy(link);
+	if (trigger_pipe[0] >= 0)
+		close(trigger_pipe[0]);
+	if (trigger_pipe[1] >= 0)
+		close(trigger_pipe[1]);
+	if (exec_pipe[0] >= 0)
+		close(exec_pipe[0]);
+	if (exec_pipe[1] >= 0)
+		close(exec_pipe[1]);
+	if (child > 0) {
+		waitpid(child, &status, 0);
+	}
+}
+
 void test_user_mem(void)
 {
 	struct user_mem *skel;
@@ -343,6 +457,8 @@ void test_user_mem(void)
 		test_invalid_prot(skel);
 	if (test__start_subtest("zero_length_mapping"))
 		test_zero_length_mapping(skel);
+	if (test__start_subtest("ia32_mmap"))
+		test_ia32_mmap(skel);
 
 out:
 	user_mem__destroy(skel);
