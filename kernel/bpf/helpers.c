@@ -3818,7 +3818,8 @@ static bool bpf_user_mm_ok(void)
  *
  * This maps memory by calling vm_mmap() directly. It does not invoke the
  * mmap(2) syscall, so seccomp filters do not mediate this mapping.
- * Note that ia32 tasks are not supported.
+ * Note that this calls vm_mmap() directly, bypassing the compat mmap
+ * syscall wrapper.
  *
  * Return: The address of the mapping on success, -EPERM if the caller has no
  * user mm, or an unsigned-long encoded negative error code, as returned by
