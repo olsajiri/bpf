@@ -16,8 +16,9 @@ extern struct static_call_tramp_key __start_static_call_tramp_key[],
 				    __stop_static_call_tramp_key[];
 
 struct static_call_site_index {
+	struct static_call_site *base;
 	unsigned int nr;
-	struct static_call_site *entries[];
+	u32 entries[];
 };
 
 /*
@@ -312,12 +313,13 @@ static int addr_conflict(struct static_call_site *site, void *start, void *end)
 	return 0;
 }
 
-static int static_call_site_index_cmp(const void *a, const void *b)
+static int static_call_site_index_cmp(const void *a, const void *b, const void *priv)
 {
-	const struct static_call_site *sa = *(struct static_call_site * const *)a;
-	const struct static_call_site *sb = *(struct static_call_site * const *)b;
-	unsigned long ca = (unsigned long)static_call_addr(sa);
-	unsigned long cb = (unsigned long)static_call_addr(sb);
+	const struct static_call_site *base = priv;
+	unsigned int ia = *(u32 *)a;
+	unsigned int ib = *(u32 *)b;
+	unsigned long ca = (unsigned long)static_call_addr(base + ia);
+	unsigned long cb = (unsigned long)static_call_addr(base + ib);
 
 	return cmp_int(ca, cb);
 }
@@ -338,11 +340,12 @@ static_call_site_index_alloc(struct static_call_site *start,
 		return NULL;
 
 	index->nr = nr;
+	index->base = start;
 	for (i = 0; i < nr; i++)
-		index->entries[i] = start + i;
+		index->entries[i] = i;
 
-	sort(index->entries, nr, sizeof(index->entries[0]),
-	     static_call_site_index_cmp, NULL);
+	sort_r(index->entries, nr, sizeof(index->entries[0]),
+	       static_call_site_index_cmp, NULL, start);
 
 	return index;
 }
@@ -356,7 +359,7 @@ static_call_site_index_text_reserved(struct static_call_site_index *index,
 	/* Find the first site after @start. */
 	while (low < high) {
 		unsigned int mid = low + (high - low) / 2;
-		void *addr = static_call_addr(index->entries[mid]);
+		void *addr = static_call_addr(index->base + index->entries[mid]);
 
 		if (addr <= start)
 			low = mid + 1;
@@ -369,7 +372,7 @@ static_call_site_index_text_reserved(struct static_call_site_index *index,
 		low--;
 
 	for (i = low; i < index->nr; i++) {
-		struct static_call_site *site = index->entries[i];
+		struct static_call_site *site = index->base + index->entries[i];
 		void *addr = static_call_addr(site);
 
 		/* Later sites cannot overlap once this address is past @end. */
