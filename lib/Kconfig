@@ -8,6 +8,9 @@ config BINARY_PRINTF
 
 menu "Library routines"
 
+config SITE_INDEX
+	bool
+
 config LINEAR_RANGES
 	tristate
 
