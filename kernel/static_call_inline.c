@@ -323,24 +323,21 @@ static int __static_call_text_reserved(struct static_call_site *iter_start,
 static int __static_call_mod_text_reserved(void *start, void *end)
 {
 	struct module *mod;
-	int ret;
 
-	scoped_guard(rcu) {
-		mod = __module_text_address((unsigned long)start);
-		WARN_ON_ONCE(__module_text_address((unsigned long)end) != mod);
-		if (!try_module_get(mod))
-			mod = NULL;
-	}
+	/*
+	 * Module memory is freed only after synchronize_rcu(), so RCU keeps
+	 * the module and its sites alive for the whole lookup.
+	 */
+	guard(rcu)();
+
+	mod = __module_text_address((unsigned long)start);
+	WARN_ON_ONCE(__module_text_address((unsigned long)end) != mod);
 	if (!mod)
 		return 0;
 
-	ret = __static_call_text_reserved(mod->static_call_sites,
+	return __static_call_text_reserved(mod->static_call_sites,
 			mod->static_call_sites + mod->num_static_call_sites,
 			start, end, mod->state == MODULE_STATE_COMING);
-
-	module_put(mod);
-
-	return ret;
 }
 
 static unsigned long tramp_key_lookup(unsigned long addr)
