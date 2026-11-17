@@ -2816,9 +2816,12 @@ static bool has_module(struct modules_array *arr, struct module *mod)
 	return false;
 }
 
-static int get_modules_for_addrs(struct module ***mods, unsigned long *addrs, u32 addrs_cnt)
+/*
+ * Add modules for @addrs to @arr. On error all the modules in @arr
+ * are released.
+ */
+static int get_modules_for_addrs(struct modules_array *arr, unsigned long *addrs, u32 addrs_cnt)
 {
-	struct modules_array arr = {};
 	u32 i, err = 0;
 
 	for (i = 0; i < addrs_cnt; i++) {
@@ -2828,7 +2831,7 @@ static int get_modules_for_addrs(struct module ***mods, unsigned long *addrs, u3
 		scoped_guard(rcu) {
 			mod = __module_address(addrs[i]);
 			/* Either no module or it's already stored  */
-			if (!mod || has_module(&arr, mod)) {
+			if (!mod || has_module(arr, mod)) {
 				skip_add = true;
 				break; /* scoped_guard */
 			}
@@ -2839,23 +2842,19 @@ static int get_modules_for_addrs(struct module ***mods, unsigned long *addrs, u3
 			continue;
 		if (err)
 			break;
-		err = add_module(&arr, mod);
+		err = add_module(arr, mod);
 		if (err) {
 			module_put(mod);
 			break;
 		}
 	}
 
-	/* We return either err < 0 in case of error, ... */
 	if (err) {
-		kprobe_multi_put_modules(arr.mods, arr.mods_cnt);
-		kfree(arr.mods);
-		return err;
+		kprobe_multi_put_modules(arr->mods, arr->mods_cnt);
+		kfree(arr->mods);
+		memset(arr, 0, sizeof(*arr));
 	}
-
-	/* or number of modules found if everything is ok. */
-	*mods = arr.mods;
-	return arr.mods_cnt;
+	return err;
 }
 
 static int addrs_check_error_injection_list(unsigned long *addrs, u32 cnt)
@@ -3127,6 +3126,7 @@ error:
 int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 {
 	struct inline_sites inlines = {};
+	struct modules_array mods = {};
 	struct bpf_kprobe_multi_link *link = NULL;
 	struct bpf_link_primer link_primer;
 	void __user *ucookies;
@@ -3296,10 +3296,11 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		       link);
 	}
 
-	err = get_modules_for_addrs(&link->mods, addrs, cnt);
-	if (err < 0)
+	err = get_modules_for_addrs(&mods, addrs, cnt);
+	if (err)
 		goto error_cleanup;
-	link->mods_cnt = err;
+	link->mods = mods.mods;
+	link->mods_cnt = mods.mods_cnt;
 
 	if (inlines.sites_cnt) {
 		err = inline_sites_register(link);
@@ -3325,6 +3326,8 @@ error_cleanup:
 	return err;
 
 error:
+	kprobe_multi_put_modules(mods.mods, mods.mods_cnt);
+	kfree(mods.mods);
 	kfree(link);
 	kvfree(addrs);
 	kvfree(cookies);
