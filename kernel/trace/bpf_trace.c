@@ -2493,6 +2493,16 @@ static void bpf_kprobe_multi_link_release(struct bpf_link *link)
 	kprobe_multi_put_modules(kmulti_link->mods, kmulti_link->mods_cnt);
 }
 
+static unsigned long inline_sites_missed(const struct inline_sites *inlines)
+{
+	unsigned long missed = 0;
+	u32 i;
+
+	for (i = 0; i < inlines->cnt; i++)
+		missed += inlines->kps[i]->nmissed;
+	return missed;
+}
+
 static void bpf_kprobe_multi_link_dealloc(struct bpf_link *link)
 {
 	struct bpf_kprobe_multi_link *kmulti_link;
@@ -2523,7 +2533,8 @@ static int bpf_kprobe_multi_link_fill_link_info(const struct bpf_link *link,
 	kmulti_link = container_of(link, struct bpf_kprobe_multi_link, link);
 	info->kprobe_multi.count = kmulti_link->cnt;
 	info->kprobe_multi.flags = kmulti_link->link.flags;
-	info->kprobe_multi.missed = kmulti_link->fp.nmissed;
+	info->kprobe_multi.missed = kmulti_link->fp.nmissed +
+				    inline_sites_missed(&kmulti_link->inlines);
 
 	if (!uaddrs)
 		return 0;
@@ -2568,9 +2579,13 @@ static void bpf_kprobe_multi_show_fdinfo(const struct bpf_link *link,
 
 	seq_printf(seq,
 		   "kprobe_cnt:\t%u\n"
+		   "kprobe_inline_cnt:\t%u\n"
+		   "kprobe_inline_skipped:\t%u\n"
 		   "missed:\t%lu\n",
 		   kmulti_link->cnt,
-		   kmulti_link->fp.nmissed);
+		   kmulti_link->inlines.cnt,
+		   kmulti_link->inlines.sites_cnt - kmulti_link->inlines.cnt,
+		   kmulti_link->fp.nmissed + inline_sites_missed(&kmulti_link->inlines));
 
 	seq_printf(seq, "%s\t %s\n", "cookie", "func");
 	for (int i = 0; i < kmulti_link->cnt; i++) {
