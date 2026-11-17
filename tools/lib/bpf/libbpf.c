@@ -13159,7 +13159,7 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	struct bpf_link *link = NULL;
 	const unsigned long *addrs;
 	int err, link_fd, prog_fd;
-	bool retprobe, session, unique_match;
+	bool retprobe, session, unique_match, inlined, inlined_strict;
 	const __u64 *cookies;
 	const char **syms;
 	size_t cnt;
@@ -13179,6 +13179,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	cnt     = OPTS_GET(opts, cnt, false);
 	cookies = OPTS_GET(opts, cookies, false);
 	unique_match = OPTS_GET(opts, unique_match, false);
+	inlined = OPTS_GET(opts, inlined, false);
+	inlined_strict = OPTS_GET(opts, inlined_strict, false);
 
 	if (!pattern && !addrs && !syms)
 		return libbpf_err_ptr(-EINVAL);
@@ -13189,6 +13191,14 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	if (!pattern && unique_match)
 		return libbpf_err_ptr(-EINVAL);
 	if (addrs && syms)
+		return libbpf_err_ptr(-EINVAL);
+	/*
+	 * Inlined instances are resolved by kernel from function names,
+	 * so we can't use addresses or pattern resolved to addresses.
+	 */
+	if (inlined && (addrs || unique_match || (pattern && strpbrk(pattern, "*?"))))
+		return libbpf_err_ptr(-EINVAL);
+	if (inlined_strict && !inlined)
 		return libbpf_err_ptr(-EINVAL);
 
 	/*
@@ -13224,6 +13234,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 
 	if (retprobe && session)
 		return libbpf_err_ptr(-EINVAL);
+	if (inlined && (retprobe || session))
+		return libbpf_err_ptr(-EINVAL);
 
 	attach_type = session ? BPF_TRACE_KPROBE_SESSION : BPF_TRACE_KPROBE_MULTI;
 
@@ -13232,6 +13244,10 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	lopts.kprobe_multi.cookies = cookies;
 	lopts.kprobe_multi.cnt = cnt;
 	lopts.kprobe_multi.flags = retprobe ? BPF_F_KPROBE_MULTI_RETURN : 0;
+	if (inlined)
+		lopts.kprobe_multi.flags |= BPF_F_KPROBE_MULTI_INLINE;
+	if (inlined_strict)
+		lopts.kprobe_multi.flags |= BPF_F_KPROBE_MULTI_INLINE_STRICT;
 
 	link = calloc(1, sizeof(*link));
 	if (!link) {
