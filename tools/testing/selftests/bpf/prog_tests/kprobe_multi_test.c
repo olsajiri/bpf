@@ -795,6 +795,55 @@ out:
 	return cnt;
 }
 
+/*
+ * Get addresses of inlined instances of @func from bpf_testmod inline BTF.
+ * Returns number of instances or -ENOENT if there's no inline BTF.
+ */
+static int get_testmod_inline_sites(const char *func, unsigned long *addrs, int max)
+{
+	struct btf *vmlinux_btf, *mod_btf = NULL, *inline_btf = NULL;
+	unsigned long base = 0;
+	int cnt = -EINVAL;
+	FILE *f;
+
+	/* LOCSEC offsets are relative to the module .text section base. */
+	f = fopen("/sys/module/bpf_testmod/sections/.text", "r");
+	if (!ASSERT_OK_PTR(f, "testmod_text"))
+		return -EINVAL;
+	if (fscanf(f, "%lx", &base) != 1)
+		base = 0;
+	fclose(f);
+	if (!ASSERT_NEQ(base, 0, "testmod_text_addr"))
+		return -EINVAL;
+
+	vmlinux_btf = btf__load_vmlinux_btf();
+	if (!ASSERT_OK_PTR(vmlinux_btf, "vmlinux_btf"))
+		return -EINVAL;
+
+	mod_btf = btf__parse_split("/sys/kernel/btf/bpf_testmod", vmlinux_btf);
+	if (!ASSERT_OK_PTR(mod_btf, "testmod_btf")) {
+		mod_btf = NULL;
+		goto out;
+	}
+
+	inline_btf = btf__parse_split("/sys/kernel/btf/bpf_testmod.inline", mod_btf);
+	cnt = libbpf_get_error(inline_btf);
+	if (cnt) {
+		inline_btf = NULL;
+		/* pahole may not have inline BTF feature support. */
+		if (cnt != -ENOENT)
+			ASSERT_OK(cnt, "parse_testmod_inline_btf");
+		goto out;
+	}
+
+	cnt = find_inline_sites(inline_btf, base, func, addrs, max);
+out:
+	btf__free(inline_btf);
+	btf__free(mod_btf);
+	btf__free(vmlinux_btf);
+	return cnt;
+}
+
 static int inline_hits(struct kprobe_multi_inline *skel, unsigned long ip, __u64 cookie)
 {
 	int i, cnt = 0;
@@ -1048,6 +1097,69 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+#define TESTMOD_INLINE		"bpf_testmod_kprobe_multi_inline"
+#define TESTMOD_INLINE_CALLER	"bpf_testmod_kprobe_multi_inline_test"
+
+/* Attach inlined function in kernel module. */
+static void test_inline_module(void)
+{
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	const char *syms[1] = { TESTMOD_INLINE };
+	struct kprobe_multi_inline *skel = NULL;
+	struct bpf_link *link = NULL;
+	unsigned long sites[INLINE_MAX];
+	__u64 cookies[1] = { 7 };
+	struct ksym *ksym;
+	int cnt;
+
+	cnt = get_testmod_inline_sites(TESTMOD_INLINE, sites, INLINE_MAX);
+	if (cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+	if (!ASSERT_EQ(cnt, 1, "sites_cnt"))
+		return;
+
+	ksym = ksym_search(sites[0]);
+	if (!ASSERT_OK_PTR(ksym, "ksym_search"))
+		return;
+	ASSERT_STREQ(ksym->name, TESTMOD_INLINE_CALLER, "inline_site_caller");
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->pid = getpid();
+
+	opts.syms = syms;
+	opts.cookies = cookies;
+	opts.cnt = ARRAY_SIZE(syms);
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
+		goto cleanup;
+
+	skel->bss->hits_cnt = 0;
+	ASSERT_OK(trigger_module_test_read(1), "trigger_read");
+
+	ASSERT_EQ(skel->bss->hits_cnt, 1, "hits_cnt");
+	ASSERT_EQ(inline_hits(skel, sites[0], 7), 1, "inline_site_hit");
+
+	/* Make sure the probe is gone after detach. */
+	bpf_link__destroy(link);
+	link = NULL;
+
+	skel->bss->hits_cnt = 0;
+	ASSERT_OK(trigger_module_test_read(1), "trigger_read");
+	ASSERT_EQ(skel->bss->hits_cnt, 0, "hits_cnt_detached");
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 /*
  * Make sure the link create fails with @error and kernel explains
  * the failure with @msg in the log.
@@ -1261,5 +1373,7 @@ void test_kprobe_multi_test(void)
 		test_inline_skip();
 	if (test__start_subtest("inline_fails"))
 		test_inline_fails();
+	if (test__start_subtest("inline_module"))
+		test_inline_module();
 	RUN_TESTS(kprobe_multi_verifier);
 }
