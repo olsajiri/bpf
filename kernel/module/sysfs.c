@@ -134,6 +134,26 @@ static void remove_sect_attrs(struct module *mod)
 }
 
 /*
+ * Returns address of the loaded section @name or 0 if there's no such
+ * section. The caller needs to make sure the module is live
+ * (MODULE_STATE_LIVE) and hold a reference to it, which keeps
+ * mod->sect_attrs stable; no other locking is needed.
+ */
+unsigned long module_sect_addr(const struct module *mod, const char *name)
+{
+	const struct bin_attribute *const *bin_attr;
+
+	if (!mod->sect_attrs)
+		return 0;
+
+	for (bin_attr = mod->sect_attrs->grp.bin_attrs; *bin_attr; bin_attr++) {
+		if (!strcmp((*bin_attr)->attr.name, name))
+			return (unsigned long)(*bin_attr)->private;
+	}
+	return 0;
+}
+
+/*
  * /sys/module/foo/notes/.section.name gives contents of SHT_NOTE sections.
  */
 
