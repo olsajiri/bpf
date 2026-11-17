@@ -886,6 +886,66 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+/* Attach function with entry probe and inlined function in single link. */
+static void test_inline_mixed(void)
+{
+	const char *syms[2] = { INLINE_INNER, "bpf_fentry_test1" };
+	LIBBPF_OPTS(bpf_link_create_opts, opts);
+	struct kprobe_multi_inline *skel = NULL;
+	unsigned long inner[INLINE_MAX], addr;
+	struct bpf_link_info info = {};
+	__u32 len = sizeof(info);
+	__u64 cookies[2] = { 6, 5 };
+	int inner_cnt, link_fd = -1, err;
+
+	inner_cnt = get_inline_sites(INLINE_INNER, inner, INLINE_MAX);
+	if (inner_cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+	if (!ASSERT_EQ(inner_cnt, 2, "inner_cnt"))
+		return;
+
+	addr = ksym_get_addr("bpf_fentry_test1");
+	if (!ASSERT_NEQ(addr, 0, "bpf_fentry_test1_addr"))
+		return;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->pid = getpid();
+
+	opts.kprobe_multi.syms = syms;
+	opts.kprobe_multi.cookies = cookies;
+	opts.kprobe_multi.cnt = ARRAY_SIZE(syms);
+	opts.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE;
+
+	link_fd = bpf_link_create(bpf_program__fd(skel->progs.test_kprobe_inline), 0,
+				  BPF_TRACE_KPROBE_MULTI, &opts);
+	if (!ASSERT_GE(link_fd, 0, "bpf_link_create"))
+		goto cleanup;
+
+	inline_trigger(skel);
+
+	ASSERT_EQ(skel->bss->hits_cnt, inner_cnt + 1, "hits_cnt");
+	ASSERT_EQ(inline_hits(skel, addr, 5), 1, "entry_hit");
+	inline_check_sites(skel, inner, inner_cnt, 6);
+
+	/* Link info shows only the function with entry probe. */
+	err = bpf_link_get_info_by_fd(link_fd, &info, &len);
+	if (!ASSERT_OK(err, "bpf_link_get_info_by_fd"))
+		goto cleanup;
+	ASSERT_EQ(info.type, BPF_LINK_TYPE_KPROBE_MULTI, "info_type");
+	ASSERT_EQ(info.kprobe_multi.count, 1, "info_count");
+	ASSERT_EQ(info.kprobe_multi.flags, BPF_F_KPROBE_MULTI_INLINE, "info_flags");
+
+cleanup:
+	if (link_fd >= 0)
+		close(link_fd);
+	kprobe_multi_inline__destroy(skel);
+}
+
 void serial_test_kprobe_multi_bench_attach(void)
 {
 	if (test__start_subtest("kernel"))
@@ -935,5 +995,7 @@ void test_kprobe_multi_test(void)
 		test_inline(false);
 	if (test__start_subtest("inline_same_addr"))
 		test_inline(true);
+	if (test__start_subtest("inline_mixed"))
+		test_inline_mixed();
 	RUN_TESTS(kprobe_multi_verifier);
 }
