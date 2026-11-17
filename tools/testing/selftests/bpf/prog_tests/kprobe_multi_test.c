@@ -11,6 +11,7 @@
 #include "kprobe_multi_verifier.skel.h"
 #include "kprobe_write_ctx.skel.h"
 #include "kprobe_multi_sleepable.skel.h"
+#include "kprobe_multi_inline.skel.h"
 #include "bpf/libbpf_internal.h"
 #include "bpf/hashmap.h"
 
@@ -703,6 +704,188 @@ cleanup:
 	kprobe_multi__destroy(skel);
 }
 
+#define INLINE_INNER	"bpf_kprobe_multi_inline_inner"
+#define INLINE_OUTER	"bpf_kprobe_multi_inline_outer"
+#define INLINE_CALLER	"bpf_kprobe_multi_inline_test"
+#define INLINE_MAX	8
+
+/*
+ * Get addresses of inlined instances of @func from inline.text LOCSEC
+ * of @inline_btf, the offsets are relative to @base. Returns number of
+ * instances or -ENOENT if there's no such LOCSEC.
+ */
+static int find_inline_sites(struct btf *inline_btf, unsigned long base, const char *func,
+			     unsigned long *addrs, int max)
+{
+	const struct btf_type *t, *ft;
+	struct btf_loc *l;
+	int id, i, n, cnt = 0;
+
+	id = btf__find_by_name_kind(inline_btf, "inline.text", BTF_KIND_LOCSEC);
+	if (id < 0)
+		return -ENOENT;
+
+	t = btf__type_by_id(inline_btf, id);
+	n = btf_vlen(t);
+	for (i = 0, l = btf_locsec_locs(t); i < n; i++, l++) {
+		ft = btf__type_by_id(inline_btf, l->func);
+		if (!ft || strcmp(btf__name_by_offset(inline_btf, ft->name_off), func))
+			continue;
+		if (!ASSERT_LT(cnt, max, "inline_sites_max"))
+			return -EINVAL;
+		addrs[cnt++] = base + l->offset;
+	}
+	return cnt;
+}
+
+/*
+ * Get addresses of inlined instances of @func from vmlinux inline BTF.
+ * Returns number of instances or -ENOENT if there's no inline BTF.
+ */
+static int get_inline_sites(const char *func, unsigned long *addrs, int max)
+{
+	struct btf *vmlinux_btf, *inline_btf = NULL;
+	unsigned long base;
+	int cnt = 0;
+
+	/* LOCSEC offsets are relative to the .text section base. */
+	base = ksym_get_addr("_stext");
+	if (!ASSERT_NEQ(base, 0, "stext_addr"))
+		return -EINVAL;
+
+	vmlinux_btf = btf__load_vmlinux_btf();
+	if (!ASSERT_OK_PTR(vmlinux_btf, "vmlinux_btf"))
+		return -EINVAL;
+
+	inline_btf = btf__parse_split("/sys/kernel/btf/vmlinux.inline", vmlinux_btf);
+	cnt = libbpf_get_error(inline_btf);
+	if (cnt) {
+		inline_btf = NULL;
+		/* pahole may not have inline BTF feature support. */
+		if (cnt != -ENOENT)
+			ASSERT_OK(cnt, "parse_inline_btf");
+		goto out;
+	}
+
+	cnt = find_inline_sites(inline_btf, base, func, addrs, max);
+out:
+	btf__free(inline_btf);
+	btf__free(vmlinux_btf);
+	return cnt;
+}
+
+static int inline_hits(struct kprobe_multi_inline *skel, unsigned long ip, __u64 cookie)
+{
+	int i, cnt = 0;
+
+	for (i = 0; i < skel->bss->hits_cnt; i++) {
+		if (skel->bss->hits_ip[i] == ip && skel->bss->hits_cookie[i] == cookie)
+			cnt++;
+	}
+	return cnt;
+}
+
+static void inline_trigger(struct kprobe_multi_inline *skel)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	int err;
+
+	skel->bss->hits_cnt = 0;
+	err = bpf_prog_test_run_opts(bpf_program__fd(skel->progs.trigger), &topts);
+	ASSERT_OK(err, "test_run");
+	ASSERT_EQ(topts.retval, 0, "test_run");
+}
+
+/* Each inlined instance must be hit just once with its function cookie. */
+static void inline_check_sites(struct kprobe_multi_inline *skel, unsigned long *addrs,
+			       int cnt, __u64 cookie)
+{
+	struct ksym *ksym;
+	int i;
+
+	for (i = 0; i < cnt; i++) {
+		ASSERT_EQ(inline_hits(skel, addrs[i], cookie), 1, "inline_site_hit");
+
+		/* And it needs to be located in one of the callers. */
+		ksym = ksym_search(addrs[i]);
+		if (!ASSERT_OK_PTR(ksym, "ksym_search"))
+			continue;
+		ASSERT_OK(strncmp(ksym->name, INLINE_CALLER, strlen(INLINE_CALLER)),
+			  "inline_site_caller");
+	}
+}
+
+static void test_inline(bool same_addr)
+{
+	unsigned long inner[INLINE_MAX], outer[INLINE_MAX];
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	const char *syms[2] = { INLINE_OUTER, INLINE_INNER };
+	__u64 cookies[2] = { 2, 1 };
+	struct kprobe_multi_inline *skel = NULL;
+	struct bpf_link *link = NULL;
+	int inner_cnt, outer_cnt, i;
+	bool shared = false;
+
+	inner_cnt = get_inline_sites(INLINE_INNER, inner, INLINE_MAX);
+	outer_cnt = get_inline_sites(INLINE_OUTER, outer, INLINE_MAX);
+	if (inner_cnt == -ENOENT || outer_cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+
+	/* inner is inlined in both callers, outer just in the first one */
+	if (!ASSERT_EQ(inner_cnt, 2, "inner_cnt") || !ASSERT_EQ(outer_cnt, 1, "outer_cnt"))
+		return;
+
+	for (i = 0; i < inner_cnt; i++)
+		shared |= inner[i] == outer[0];
+
+	/* Compiler did not place inner and outer instances on same address. */
+	if (same_addr && !shared) {
+		test__skip();
+		return;
+	}
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->pid = getpid();
+
+	opts.syms = syms;
+	opts.cookies = cookies;
+	opts.cnt = ARRAY_SIZE(syms);
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
+		goto cleanup;
+
+	inline_trigger(skel);
+
+	ASSERT_EQ(skel->bss->hits_cnt, inner_cnt + outer_cnt, "hits_cnt");
+	inline_check_sites(skel, inner, inner_cnt, 1);
+	inline_check_sites(skel, outer, outer_cnt, 2);
+
+	if (same_addr) {
+		/* Both instances on the same address got their own cookie. */
+		ASSERT_EQ(inline_hits(skel, outer[0], 1), 1, "same_addr_inner");
+		ASSERT_EQ(inline_hits(skel, outer[0], 2), 1, "same_addr_outer");
+	}
+
+	/* Make sure the probes are gone after detach. */
+	bpf_link__destroy(link);
+	link = NULL;
+
+	inline_trigger(skel);
+	ASSERT_EQ(skel->bss->hits_cnt, 0, "hits_cnt_detached");
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 void serial_test_kprobe_multi_bench_attach(void)
 {
 	if (test__start_subtest("kernel"))
@@ -748,5 +931,9 @@ void test_kprobe_multi_test(void)
 		test_attach_write_ctx();
 	if (test__start_subtest("dup_sym"))
 		test_attach_probe_dup_sym();
+	if (test__start_subtest("inline_attach"))
+		test_inline(false);
+	if (test__start_subtest("inline_same_addr"))
+		test_inline(true);
 	RUN_TESTS(kprobe_multi_verifier);
 }
