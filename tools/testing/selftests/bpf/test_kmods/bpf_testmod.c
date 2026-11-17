@@ -166,6 +166,19 @@ bpf_testmod_test_union_arg_2(int a, union bpf_testmod_union_arg_2 b)
 	return bpf_testmod_test_struct_arg_result;
 }
 
+/* Inlined function for kprobe multi inline tests. */
+static __always_inline int bpf_testmod_kprobe_multi_inline(int a)
+{
+	/* Keep an instruction in the inline site. */
+	asm volatile("nop");
+	return a + 1;
+}
+
+noinline int bpf_testmod_kprobe_multi_inline_test(int a)
+{
+	return bpf_testmod_kprobe_multi_inline(a);
+}
+
 noinline int
 bpf_testmod_test_arg_ptr_to_struct(struct bpf_testmod_struct_arg_1 *a) {
 	bpf_testmod_test_struct_arg_result = a->a;
@@ -812,6 +825,8 @@ bpf_testmod_test_read(struct file *file, struct kobject *kobj,
 	(void)bpf_testmod_test_union_arg_2(6, union_arg2);
 
 	(void)bpf_testmod_test_arg_ptr_to_struct(&struct_arg1_2);
+
+	(void)bpf_testmod_kprobe_multi_inline_test(1);
 
 #ifdef __SIZEOF_INT128__
 	(void)bpf_testmod_test_int128_ret(i);
