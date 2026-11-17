@@ -331,10 +331,19 @@ show_kprobe_multi_json(struct bpf_link_info *info, json_writer_t *wtr)
 
 	jsonw_bool_field(json_wtr, "retprobe",
 			 info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_RETURN);
+	jsonw_bool_field(json_wtr, "inline",
+			 info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_INLINE);
+	jsonw_bool_field(json_wtr, "inline_strict",
+			 info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_INLINE_STRICT);
 	jsonw_uint_field(json_wtr, "func_cnt", info->kprobe_multi.count);
 	jsonw_uint_field(json_wtr, "missed", info->kprobe_multi.missed);
 	jsonw_name(json_wtr, "funcs");
 	jsonw_start_array(json_wtr);
+	/* Link with inline flag can have only inlined instances attached. */
+	if (!info->kprobe_multi.count) {
+		jsonw_end_array(json_wtr);
+		return;
+	}
 	data = get_addr_cookie_array(u64_to_ptr(info->kprobe_multi.addrs),
 				     u64_to_ptr(info->kprobe_multi.cookies),
 				     info->kprobe_multi.count);
@@ -832,16 +841,25 @@ static void show_kprobe_multi_plain(struct bpf_link_info *info)
 	__u32 i, j = 0;
 	bool is_ibt_enabled;
 
-	if (!info->kprobe_multi.count)
+	bool is_inline = info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_INLINE;
+
+	/* Link with inline flag can have only inlined instances attached. */
+	if (!info->kprobe_multi.count && !is_inline)
 		return;
 
 	if (info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_RETURN)
 		printf("\n\tkretprobe.multi  ");
 	else
 		printf("\n\tkprobe.multi  ");
+	if (is_inline)
+		printf("inline  ");
+	if (info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_INLINE_STRICT)
+		printf("inline_strict  ");
 	printf("func_cnt %u  ", info->kprobe_multi.count);
 	if (info->kprobe_multi.missed)
 		printf("missed %llu  ", info->kprobe_multi.missed);
+	if (!info->kprobe_multi.count)
+		return;
 	data = get_addr_cookie_array(u64_to_ptr(info->kprobe_multi.addrs),
 				     u64_to_ptr(info->kprobe_multi.cookies),
 				     info->kprobe_multi.count);
