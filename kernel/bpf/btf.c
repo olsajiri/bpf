@@ -9363,6 +9363,9 @@ struct btf_module {
 	struct bin_attribute *sysfs_attr;
 	struct bin_attribute *sysfs_inline_attr;
 	void *btf_inline_data;
+	u32 btf_inline_data_size;
+	/* Parsed on first use, check btf_for_each_module_inline. */
+	struct btf *inline_btf;
 	int flags;
 };
 
@@ -9538,6 +9541,7 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 		btf_mod->module = module;
 		btf_mod->btf = btf;
 		btf_mod->btf_inline_data = relocated_inline_data;
+		btf_mod->btf_inline_data_size = inline_data_size;
 		list_add(&btf_mod->list, &btf_modules);
 		mutex_unlock(&btf_module_mutex);
 
@@ -9597,6 +9601,8 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 			if (btf_mod->sysfs_inline_attr)
 				sysfs_btf_remove(btf_mod->sysfs_inline_attr);
 			kvfree(btf_mod->btf_inline_data);
+			if (btf_mod->inline_btf)
+				btf_free(btf_mod->inline_btf);
 			purge_cand_cache(btf_mod->btf);
 			btf_put(btf_mod->btf);
 			kfree(btf_mod);
@@ -9621,6 +9627,64 @@ static int __init btf_module_init(void)
 }
 
 fs_initcall(btf_module_init);
+
+#if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
+static struct btf *btf_module_inline_btf(struct btf_module *btf_mod)
+{
+	struct btf_verifier_env *env;
+	struct btf *btf;
+
+	lockdep_assert_held(&btf_module_mutex);
+
+	if (btf_mod->inline_btf)
+		return btf_mod->inline_btf;
+
+	env = kzalloc_obj(*env, GFP_KERNEL | __GFP_NOWARN);
+	if (!env)
+		return ERR_PTR(-ENOMEM);
+
+	env->log.level = BPF_LOG_KERNEL;
+	btf = btf_parse_split(env, btf_mod->module->name, btf_mod->btf_inline_data,
+			      btf_mod->btf_inline_data_size, btf_mod->btf);
+	btf_verifier_env_free(env);
+	if (!IS_ERR(btf))
+		btf_mod->inline_btf = btf;
+	return btf;
+}
+
+/*
+ * Call @fn for each live module with inline BTF, the split BTF on top
+ * of module BTF that describes inline sites in the module.
+ *
+ * The inline BTF is parsed on first use and stays cached until the
+ * module is gone. The module reference is held just for the @fn call,
+ * so @fn needs to get its own to keep using the module or its BTF.
+ *
+ * The iteration stops when @fn returns non zero value, which is then
+ * returned.
+ */
+int btf_for_each_module_inline(btf_module_inline_fn fn, void *data)
+{
+	struct btf_module *btf_mod;
+	struct btf *btf;
+	int err = 0;
+
+	mutex_lock(&btf_module_mutex);
+	list_for_each_entry(btf_mod, &btf_modules, list) {
+		if (!btf_mod->btf_inline_data || !(btf_mod->flags & BTF_MODULE_F_LIVE))
+			continue;
+		if (!try_module_get(btf_mod->module))
+			continue;
+		btf = btf_module_inline_btf(btf_mod);
+		err = IS_ERR(btf) ? PTR_ERR(btf) : fn(btf_mod->module, btf, data);
+		module_put(btf_mod->module);
+		if (err)
+			break;
+	}
+	mutex_unlock(&btf_module_mutex);
+	return err;
+}
+#endif /* IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE) */
 #endif /* CONFIG_DEBUG_INFO_BTF_MODULES */
 
 #if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
