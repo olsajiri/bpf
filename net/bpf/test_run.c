@@ -6,6 +6,7 @@
 #include <linux/btf_ids.h>
 #include <linux/slab.h>
 #include <linux/init.h>
+#include <linux/kprobes.h>
 #include <linux/vmalloc.h>
 #include <linux/etherdevice.h>
 #include <linux/filter.h>
@@ -558,6 +559,69 @@ noinline int bpf_fentry_test10(const void *a)
 	return (long)a;
 }
 
+/*
+ * Inlined functions for kprobe multi inline tests, the outer function
+ * starts with the inner one, so their inlined instances in
+ * bpf_kprobe_multi_inline_test1 share the address.
+ */
+static __always_inline int bpf_kprobe_multi_inline_inner(int a)
+{
+	/*
+	 * Keep an instruction in the inline site, there's no argument
+	 * setup, so it's the first instruction of the outer function
+	 * inline site as well.
+	 */
+	asm volatile("nop");
+	return a + 1;
+}
+
+static __always_inline int bpf_kprobe_multi_inline_outer(int a)
+{
+	return bpf_kprobe_multi_inline_inner(a) + 1;
+}
+
+noinline int bpf_kprobe_multi_inline_test1(int a)
+{
+	return bpf_kprobe_multi_inline_outer(a);
+}
+
+noinline int bpf_kprobe_multi_inline_test2(int a)
+{
+	return bpf_kprobe_multi_inline_inner(a);
+}
+
+/*
+ * Inlined functions with instances that can't be attached, because
+ * kprobes are not allowed in bpf_kprobe_multi_inline_test4:
+ *
+ *   bpf_kprobe_multi_inline_partial  - one instance can be attached
+ *                                      (test3) and one can't (test4)
+ *   bpf_kprobe_multi_inline_nokprobe - no instance can be attached
+ */
+static __always_inline int bpf_kprobe_multi_inline_partial(int a)
+{
+	asm volatile("nop");
+	return a + 1;
+}
+
+static __always_inline int bpf_kprobe_multi_inline_nokprobe(int a)
+{
+	asm volatile("nop");
+	return a + 2;
+}
+
+noinline int bpf_kprobe_multi_inline_test3(int a)
+{
+	return bpf_kprobe_multi_inline_partial(a);
+}
+
+noinline int bpf_kprobe_multi_inline_test4(int a)
+{
+	return bpf_kprobe_multi_inline_partial(a) +
+	       bpf_kprobe_multi_inline_nokprobe(a);
+}
+NOKPROBE_SYMBOL(bpf_kprobe_multi_inline_test4);
+
 noinline void bpf_fentry_test_sinfo(struct skb_shared_info *sinfo)
 {
 }
@@ -710,7 +774,11 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
 		    bpf_fentry_test7((struct bpf_fentry_test_t *)0) != 0 ||
 		    bpf_fentry_test8(&arg) != 0 ||
 		    bpf_fentry_test9(&retval) != 0 ||
-		    bpf_fentry_test10((void *)0) != 0)
+		    bpf_fentry_test10((void *)0) != 0 ||
+		    bpf_kprobe_multi_inline_test1(1) != 3 ||
+		    bpf_kprobe_multi_inline_test2(1) != 2 ||
+		    bpf_kprobe_multi_inline_test3(1) != 2 ||
+		    bpf_kprobe_multi_inline_test4(1) != 5)
 			goto out;
 		break;
 	case BPF_MODIFY_RETURN:
