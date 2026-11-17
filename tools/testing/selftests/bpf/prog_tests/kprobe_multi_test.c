@@ -1048,6 +1048,164 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+/*
+ * Make sure the link create fails with @error and kernel explains
+ * the failure with @msg in the log.
+ */
+static bool inline_link_fails(int prog_fd, enum bpf_attach_type type,
+			      struct bpf_link_create_opts *lopts,
+			      int error, const char *msg)
+{
+	LIBBPF_OPTS(bpf_log_opts, log_opts);
+	char log_buf[4096] = {};
+	int saved_error, link_fd;
+
+	log_opts.buf = log_buf;
+	log_opts.size = sizeof(log_buf);
+	log_opts.level = 1;
+	lopts->log_opts = &log_opts;
+
+	link_fd = bpf_link_create(prog_fd, 0, type, lopts);
+	saved_error = -errno;
+	if (!ASSERT_LT(link_fd, 0, "link_create")) {
+		close(link_fd);
+		return false;
+	}
+	ASSERT_EQ(saved_error, error, "link_create_error");
+	ASSERT_HAS_SUBSTR(log_buf, msg, "link_create_log");
+	return true;
+}
+
+static void test_inline_fails(void)
+{
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	LIBBPF_OPTS(bpf_link_create_opts, lopts);
+	struct kprobe_multi_inline *skel = NULL;
+	const char *syms[1] = { INLINE_INNER };
+	const char *nosyms[1] = { "bpf_kprobe_multi_inline_nonexistent" };
+	const char *nokprobe[1] = { INLINE_NOKPROBE };
+	unsigned long inner[INLINE_MAX], addrs[1];
+	int saved_error, prog_fd;
+	struct bpf_link *link = NULL;
+
+	if (get_inline_sites(INLINE_INNER, inner, INLINE_MAX) == -ENOENT) {
+		test__skip();
+		return;
+	}
+
+	addrs[0] = ksym_get_addr("bpf_fentry_test1");
+	if (!ASSERT_NEQ(addrs[0], 0, "bpf_fentry_test1_addr"))
+		return;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	prog_fd = bpf_program__fd(skel->progs.test_kprobe_inline);
+
+	/* fail_1 - inlined with addrs */
+	opts.addrs = addrs;
+	opts.cnt = 1;
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "fail_1"))
+		goto cleanup;
+	ASSERT_EQ(saved_error, -EINVAL, "fail_1_error");
+
+	lopts.kprobe_multi.addrs = addrs;
+	lopts.kprobe_multi.cnt = 1;
+	lopts.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE;
+
+	if (!inline_link_fails(prog_fd, BPF_TRACE_KPROBE_MULTI, &lopts, -EINVAL,
+			       "Inlined functions need to be specified with kprobe_multi.syms."))
+		goto cleanup;
+
+	/* fail_2 - inlined with return probe */
+	LIBBPF_OPTS_RESET(opts,
+		.syms = syms,
+		.cnt = 1,
+		.inlined = true,
+		.retprobe = true,
+	);
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "fail_2"))
+		goto cleanup;
+	ASSERT_EQ(saved_error, -EINVAL, "fail_2_error");
+
+	LIBBPF_OPTS_RESET(lopts,
+		.kprobe_multi.syms = syms,
+		.kprobe_multi.cnt = 1,
+		.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE | BPF_F_KPROBE_MULTI_RETURN,
+	);
+
+	if (!inline_link_fails(prog_fd, BPF_TRACE_KPROBE_MULTI, &lopts, -EINVAL,
+			       "Inlined functions can't be attached with return probe."))
+		goto cleanup;
+
+	/* fail_3 - inlined with session program */
+	lopts.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE;
+
+	if (!inline_link_fails(bpf_program__fd(skel->progs.test_session_inline),
+			       BPF_TRACE_KPROBE_SESSION, &lopts, -EINVAL,
+			       "Inlined functions can't be attached with session or override "
+			       "program."))
+		goto cleanup;
+
+	/* fail_4 - inlined with wildcard pattern */
+	LIBBPF_OPTS_RESET(opts,
+		.inlined = true,
+	);
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     "bpf_kprobe_multi_inline_*", &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "fail_4"))
+		goto cleanup;
+	ASSERT_EQ(saved_error, -EINVAL, "fail_4_error");
+
+	/* fail_5 - function with no entry and no inlined instance */
+	LIBBPF_OPTS_RESET(opts,
+		.syms = nosyms,
+		.cnt = 1,
+		.inlined = true,
+	);
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "fail_5"))
+		goto cleanup;
+	ASSERT_EQ(saved_error, -ENOENT, "fail_5_error");
+
+	LIBBPF_OPTS_RESET(lopts,
+		.kprobe_multi.syms = nosyms,
+		.kprobe_multi.cnt = 1,
+		.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE,
+	);
+
+	if (!inline_link_fails(prog_fd, BPF_TRACE_KPROBE_MULTI, &lopts, -ESRCH,
+			       "Function bpf_kprobe_multi_inline_nonexistent has no entry and "
+			       "no inlined instance."))
+		goto cleanup;
+
+	/* fail_6 - function with no entry and no inlined instance that can be attached */
+	lopts.kprobe_multi.syms = nokprobe;
+
+	inline_link_fails(prog_fd, BPF_TRACE_KPROBE_MULTI, &lopts, -EINVAL,
+			  "Function " INLINE_NOKPROBE " has no entry and none of its "
+			  "inlined instances can be attached, bpf_kprobe_multi_inline_test4+");
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 void serial_test_kprobe_multi_bench_attach(void)
 {
 	if (test__start_subtest("kernel"))
@@ -1101,5 +1259,7 @@ void test_kprobe_multi_test(void)
 		test_inline_mixed();
 	if (test__start_subtest("inline_skip"))
 		test_inline_skip();
+	if (test__start_subtest("inline_fails"))
+		test_inline_fails();
 	RUN_TESTS(kprobe_multi_verifier);
 }

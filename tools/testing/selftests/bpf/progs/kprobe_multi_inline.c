@@ -39,3 +39,9 @@ int test_kprobe_inline(struct pt_regs *ctx)
 	hits_cnt = idx + 1;
 	return 0;
 }
+
+SEC("kprobe.session")
+int test_session_inline(struct pt_regs *ctx)
+{
+	return 0;
+}
