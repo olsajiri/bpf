@@ -952,6 +952,15 @@ static inline bool module_sig_ok(struct module *module)
 }
 #endif	/* CONFIG_MODULE_SIG */
 
+#if defined(CONFIG_MODULES) && defined(CONFIG_KALLSYMS) && defined(CONFIG_SYSFS)
+unsigned long module_sect_addr(const struct module *mod, const char *name);
+#else
+static inline unsigned long module_sect_addr(const struct module *mod, const char *name)
+{
+	return 0;
+}
+#endif
+
 #if defined(CONFIG_MODULES) && defined(CONFIG_KALLSYMS)
 int module_kallsyms_on_each_symbol(const char *modname,
 				   int (*fn)(void *, const char *, unsigned long),
