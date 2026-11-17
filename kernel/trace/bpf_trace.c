@@ -2371,6 +2371,7 @@ struct bpf_kprobe_multi_link;
 struct inline_site {
 	struct kprobe kp;
 	struct bpf_kprobe_multi_link *link;
+	u64 cookie;
 	u32 sym_idx;
 	bool has_entry;
 };
@@ -2401,6 +2402,7 @@ struct bpf_kprobe_multi_run_ctx {
 	struct bpf_session_run_ctx session_ctx;
 	struct bpf_kprobe_multi_link *link;
 	unsigned long entry_ip;
+	struct inline_site *site;
 };
 
 struct user_syms {
@@ -2628,6 +2630,8 @@ static u64 bpf_kprobe_multi_cookie(struct bpf_run_ctx *ctx)
 		return 0;
 	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
 			       session_ctx.run_ctx);
+	if (run_ctx->site)
+		return run_ctx->site->cookie;
 	link = run_ctx->link;
 	if (!link->cookies)
 		return 0;
@@ -2651,6 +2655,7 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
+			   struct inline_site *site,
 			   unsigned long entry_ip, struct ftrace_regs *fregs,
 			   struct pt_regs *regs, bool is_return, void *data)
 {
@@ -2661,6 +2666,7 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 		},
 		.link = link,
 		.entry_ip = entry_ip,
+		.site = site,
 	};
 	struct bpf_run_ctx *old_run_ctx;
 	int err;
@@ -2703,7 +2709,7 @@ kprobe_multi_link_handler(struct fprobe *fp, unsigned long fentry_ip,
 	int err;
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
-	err = kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
+	err = kprobe_multi_link_prog_run(link, NULL, ftrace_get_entry_ip(fentry_ip),
 					 fregs, NULL, false, data);
 	return is_kprobe_session(link->link.prog) ? err : 0;
 }
@@ -2716,7 +2722,7 @@ kprobe_multi_link_exit_handler(struct fprobe *fp, unsigned long fentry_ip,
 	struct bpf_kprobe_multi_link *link;
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
-	kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
+	kprobe_multi_link_prog_run(link, NULL, ftrace_get_entry_ip(fentry_ip),
 				   fregs, NULL, true, data);
 }
 
@@ -2726,7 +2732,7 @@ kprobe_multi_inline_handler(struct kprobe *kp, struct pt_regs *regs)
 	struct inline_site *site;
 
 	site = container_of(kp, struct inline_site, kp);
-	kprobe_multi_link_prog_run(site->link, (unsigned long)kp->addr,
+	kprobe_multi_link_prog_run(site->link, site, (unsigned long)kp->addr,
 				   NULL, regs, false, NULL);
 	return 0;
 }
@@ -2884,6 +2890,7 @@ struct inline_lookup {
 	/* Input: functions to look for, @syms is alphabetically sorted. */
 	const char **syms;
 	unsigned long *addrs;
+	u64 *cookies;
 	u32 syms_cnt;
 
 	/* Output */
@@ -2967,8 +2974,8 @@ static void inline_lookup_sort(struct inline_lookup *lookup)
  * Find inlined instances for functions in @lookup->syms and store them
  * in @lookup->inlines. On top of that make sure each function has either
  * address resolved in @lookup->addrs or at least one inlined instance,
- * and remove unresolved functions from @lookup->addrs array, the number
- * of functions left is stored in @lookup->addrs_cnt.
+ * and remove unresolved functions from @lookup->addrs and @lookup->cookies
+ * arrays, the number of functions left is stored in @lookup->addrs_cnt.
  *
  * Each inlined instance gets has_entry set if its function has address
  * resolved in @lookup->addrs, so it gets attached through its entry.
@@ -2978,6 +2985,7 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 	struct inline_sites *inlines = lookup->inlines;
 	unsigned long *addrs = lookup->addrs;
 	u32 i, j, k, n, cnt = lookup->syms_cnt;
+	u64 *cookies = lookup->cookies;
 	struct inline_site *sites;
 	struct btf *btf;
 	int err;
@@ -3005,12 +3013,13 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 		sites[i].kp.pre_handler = kprobe_multi_inline_handler;
 		/* Registered disabled and enabled all at once. */
 		sites[i].kp.flags = KPROBE_FLAG_DISABLED;
+		sites[i].cookie = cookies ? cookies[sites[i].sym_idx] : 0;
 		sites[i].has_entry = !!addrs[sites[i].sym_idx];
 	}
 
 	/*
 	 * Each function needs to have either entry or inlined instance,
-	 * keep only functions with entry in @addrs array.
+	 * keep only functions with entry in @addrs and @cookies arrays.
 	 * The instances are sorted by function, so we walk them together.
 	 */
 	for (i = 0, j = 0, k = 0; i < cnt; i++) {
@@ -3023,6 +3032,8 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 			goto error;
 		}
 		addrs[j] = addrs[i];
+		if (cookies)
+			cookies[j] = cookies[i];
 		j++;
 	}
 
@@ -3218,6 +3229,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 				.syms     = us.syms,
 				.syms_cnt = cnt,
 				.addrs    = addrs,
+				.cookies  = cookies,
 			};
 
 			err = inline_lookup_symbols(&lookup);
