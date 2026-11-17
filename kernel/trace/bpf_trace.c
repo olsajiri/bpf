@@ -2817,8 +2817,8 @@ static bool has_module(struct modules_array *arr, struct module *mod)
 }
 
 /*
- * Add modules for @addrs to @arr. On error all the modules in @arr
- * are released.
+ * Add modules for @addrs to @arr, which might already have modules
+ * with inlined instances. On error all the modules in @arr are released.
  */
 static int get_modules_for_addrs(struct modules_array *arr, unsigned long *addrs, u32 addrs_cnt)
 {
@@ -2903,6 +2903,7 @@ struct inline_lookup {
 
 	/* Output */
 	struct inline_sites *inlines;
+	struct modules_array *mods;
 	u32 addrs_cnt;
 
 	/* Lookup state */
@@ -2957,6 +2958,58 @@ static int inline_lookup_locsec(struct inline_lookup *lookup, const struct btf *
 	return 0;
 }
 
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+static int inline_lookup_module(struct module *mod, const struct btf *btf, void *data)
+{
+	u32 id, nr_types = btf_nr_types(btf);
+	struct inline_lookup *lookup = data;
+	const struct btf_type *t;
+	u32 cnt = lookup->cnt;
+	unsigned long base;
+	const char *name;
+	int err;
+
+	/*
+	 * Each section with inlined instances has its own LOCSEC named
+	 * as inline<section> with offsets relative to the section start.
+	 */
+	for (id = btf_nr_types(btf_base_btf(btf)); id < nr_types; id++) {
+		t = btf_type_by_id(btf, id);
+		if (btf_kind(t) != BTF_KIND_LOCSEC)
+			continue;
+		name = btf_name_by_offset(btf, t->name_off);
+		if (!name || !str_has_prefix(name, "inline"))
+			continue;
+		/* Skip sections that are not loaded or are freed already (init). */
+		base = module_sect_addr(mod, name + strlen("inline"));
+		if (!base || !within_module_mem_type(base, mod, MOD_TEXT))
+			continue;
+		err = inline_lookup_locsec(lookup, btf, t, base);
+		if (err)
+			return err;
+	}
+
+	if (lookup->cnt == cnt)
+		return 0;
+
+	/* Keep the module we have inlined instances in. */
+	err = add_module(lookup->mods, mod);
+	if (!err)
+		__module_get(mod);
+	return err;
+}
+
+static int inline_lookup_modules(struct inline_lookup *lookup)
+{
+	return btf_for_each_module_inline(inline_lookup_module, lookup);
+}
+#else
+static int inline_lookup_modules(struct inline_lookup *lookup)
+{
+	return 0;
+}
+#endif
+
 /*
  * Sort instances by function and address, so instances of each
  * function are next to each other, and get rid of duplicates.
@@ -2979,11 +3032,14 @@ static void inline_lookup_sort(struct inline_lookup *lookup)
 }
 
 /*
- * Find inlined instances for functions in @lookup->syms and store them
- * in @lookup->inlines. On top of that make sure each function has either
- * address resolved in @lookup->addrs or at least one inlined instance,
- * and remove unresolved functions from @lookup->addrs and @lookup->cookies
- * arrays, the number of functions left is stored in @lookup->addrs_cnt.
+ * Find inlined instances for functions in @lookup->syms in kernel and
+ * modules and store them in @lookup->inlines, modules with inlined
+ * instances are stored in @lookup->mods with reference taken.
+ *
+ * On top of that make sure each function has either address resolved
+ * in @lookup->addrs or at least one inlined instance, and remove
+ * unresolved functions from @lookup->addrs and @lookup->cookies arrays,
+ * the number of functions left is stored in @lookup->addrs_cnt.
  *
  * Each inlined instance gets has_entry set if its function has address
  * resolved in @lookup->addrs, so it gets attached through its entry.
@@ -3007,6 +3063,10 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 	id = btf_find_by_name_kind(btf, "inline.text", BTF_KIND_LOCSEC);
 	if (id < 0)
 		return -EOPNOTSUPP;
+
+	err = inline_lookup_modules(lookup);
+	if (err)
+		goto error;
 
 	err = inline_lookup_locsec(lookup, btf, btf_type_by_id(btf, id), (unsigned long)_stext);
 	if (err)
@@ -3235,6 +3295,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		if ((flags & BPF_F_KPROBE_MULTI_INLINE) && (!err || err == -ESRCH)) {
 			struct inline_lookup lookup = {
 				.inlines  = &inlines,
+				.mods     = &mods,
 				.syms     = us.syms,
 				.syms_cnt = cnt,
 				.addrs    = addrs,
