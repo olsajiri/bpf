@@ -648,10 +648,20 @@ struct bpf_kprobe_multi_opts {
 	bool session;
 	/* enforce unique match */
 	bool unique_match;
+	/*
+	 * attach also to inlined instances of functions, functions need
+	 * to be specified by name (syms or pattern without wildcards)
+	 */
+	bool inlined;
+	/*
+	 * fail the attach if there's inlined instance that can't be
+	 * attached (skipped by default), needs to be used with inlined
+	 */
+	bool inlined_strict;
 	size_t :0;
 };
 
-#define bpf_kprobe_multi_opts__last_field unique_match
+#define bpf_kprobe_multi_opts__last_field inlined_strict
 
 LIBBPF_API struct bpf_link *
 bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
