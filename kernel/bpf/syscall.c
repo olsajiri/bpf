@@ -6018,7 +6018,7 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr, struct bpf_common_a
 			ret = bpf_perf_link_attach(attr, prog);
 		else if (attr->link_create.attach_type == BPF_TRACE_KPROBE_MULTI ||
 			 attr->link_create.attach_type == BPF_TRACE_KPROBE_SESSION)
-			ret = bpf_kprobe_multi_link_attach(attr, prog);
+			ret = bpf_kprobe_multi_link_attach(attr, prog, log);
 		else if (attr->link_create.attach_type == BPF_TRACE_UPROBE_MULTI ||
 			 attr->link_create.attach_type == BPF_TRACE_UPROBE_SESSION)
 			ret = bpf_uprobe_multi_link_attach(attr, prog);
