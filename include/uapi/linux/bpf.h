@@ -1369,11 +1369,17 @@ enum bpf_perf_event_type {
  *
  * BPF_F_KPROBE_MULTI_RETURN creates return probe.
  *
- * BPF_F_KPROBE_MULTI_INLINE attaches also to inlined function instances.
+ * BPF_F_KPROBE_MULTI_INLINE attaches also to inlined function instances,
+ * the instances that can't be attached are skipped.
+ *
+ * BPF_F_KPROBE_MULTI_INLINE_STRICT fails the attach if there's inlined
+ * function instance that can't be attached, it needs to be used together
+ * with BPF_F_KPROBE_MULTI_INLINE.
  */
 enum {
 	BPF_F_KPROBE_MULTI_RETURN = (1U << 0),
 	BPF_F_KPROBE_MULTI_INLINE = (1U << 1),
+	BPF_F_KPROBE_MULTI_INLINE_STRICT = (1U << 2),
 };
 
 /* link_create.uprobe_multi.flags used in LINK_CREATE command for
