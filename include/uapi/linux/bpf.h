@@ -1365,10 +1365,15 @@ enum bpf_perf_event_type {
 #define BPF_F_TEST_REG_INVARIANTS	(1U << 7)
 
 /* link_create.kprobe_multi.flags used in LINK_CREATE command for
- * BPF_TRACE_KPROBE_MULTI attach type to create return probe.
+ * BPF_TRACE_KPROBE_MULTI attach type.
+ *
+ * BPF_F_KPROBE_MULTI_RETURN creates return probe.
+ *
+ * BPF_F_KPROBE_MULTI_INLINE attaches also to inlined function instances.
  */
 enum {
-	BPF_F_KPROBE_MULTI_RETURN = (1U << 0)
+	BPF_F_KPROBE_MULTI_RETURN = (1U << 0),
+	BPF_F_KPROBE_MULTI_INLINE = (1U << 1),
 };
 
 /* link_create.uprobe_multi.flags used in LINK_CREATE command for
