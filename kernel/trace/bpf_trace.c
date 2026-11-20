@@ -3075,6 +3075,7 @@ struct inline_lookup {
 	u64 *cookies;
 	u8 *args_cnt;
 	u32 syms_cnt;
+	struct bpf_verifier_log *log;
 
 	/* Output */
 	struct inline_sites *inlines;
@@ -3094,8 +3095,11 @@ static int inline_lookup_add(struct inline_lookup *lookup, const struct btf *btf
 	struct inline_site *sites;
 	u32 cap;
 
-	if (lookup->cnt == MAX_KPROBE_MULTI_CNT)
+	if (lookup->cnt == MAX_KPROBE_MULTI_CNT) {
+		bpf_log(lookup->log, "Number of inlined instances is above the limit %u.\n",
+			MAX_KPROBE_MULTI_CNT);
 		return -E2BIG;
+	}
 
 	if (lookup->cnt == lookup->cap) {
 		cap = max(16, lookup->cap * 2);
@@ -3249,6 +3253,7 @@ static void inline_lookup_sort(struct inline_lookup *lookup)
 static int inline_lookup_symbols(struct inline_lookup *lookup)
 {
 	struct inline_sites *inlines = lookup->inlines;
+	struct bpf_verifier_log *log = lookup->log;
 	unsigned long *addrs = lookup->addrs;
 	u32 i, j, k, n, cnt = lookup->syms_cnt;
 	u64 *cookies = lookup->cookies;
@@ -3258,13 +3263,17 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 	s32 id;
 
 	btf = bpf_get_btf_vmlinux_inline();
-	if (IS_ERR_OR_NULL(btf))
+	if (IS_ERR_OR_NULL(btf)) {
+		bpf_log(log, "Kernel inline BTF is not available.\n");
 		return -EOPNOTSUPP;
+	}
 
 	/* The offsets of inline.text locations are relative to .text section. */
 	id = btf_find_by_name_kind(btf, "inline.text", BTF_KIND_LOCSEC);
-	if (id < 0)
+	if (id < 0) {
+		bpf_log(log, "Kernel inline BTF is not available.\n");
 		return -EOPNOTSUPP;
+	}
 
 	err = inline_lookup_modules(lookup);
 	if (err)
@@ -3299,6 +3308,8 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 		if (!addrs[i]) {
 			if (k < n && sites[k].sym_idx == i)
 				continue;
+			bpf_log(log, "Function %s has no entry and no inlined instance.\n",
+				lookup->syms[i]);
 			err = -ESRCH;
 			goto error;
 		}
@@ -3325,15 +3336,17 @@ error:
  *
  * Each function needs to have something attached, so fail if there's
  * function that has no entry and all its inlined instances failed to
- * register, with the error of the first instance that failed.
+ * register. Its first instance is returned in *@failed together with
+ * the error of the first instance that failed.
  *
  * The instances are sorted by function, so we can check that when we
  * get to the last instance of the function.
  *
  * With @strict nothing is skipped, the first instance that fails to
- * register fails the link with its error.
+ * register is returned in *@failed together with its error.
  */
-static int inline_sites_register(struct bpf_kprobe_multi_link *link, bool strict)
+static int inline_sites_register(struct bpf_kprobe_multi_link *link, bool strict,
+				 struct inline_site **failed)
 {
 	struct inline_sites *inlines = &link->inlines;
 	struct inline_site *site, *first = NULL;
@@ -3359,8 +3372,10 @@ static int inline_sites_register(struct bpf_kprobe_multi_link *link, bool strict
 		err = register_kprobe(&site->kp);
 		if (err == -ENOMEM)
 			goto error;
-		if (err && strict)
+		if (err && strict) {
+			*failed = site;
 			goto error;
+		}
 		if (err) {
 			first_err = first_err ?: err;
 		} else {
@@ -3372,6 +3387,7 @@ static int inline_sites_register(struct bpf_kprobe_multi_link *link, bool strict
 		if (i + 1 < inlines->sites_cnt && site[1].sym_idx == site->sym_idx)
 			continue;
 		if (!attached) {
+			*failed = first;
 			err = first_err;
 			goto error;
 		}
@@ -3392,9 +3408,12 @@ error:
 	return err;
 }
 
-int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog,
+				 struct bpf_verifier_log *log)
 {
 	struct inline_sites inlines = {};
+	struct inline_site *failed = NULL;
+	struct user_syms us = {};
 	struct modules_array mods = {};
 	struct bpf_kprobe_multi_link *link = NULL;
 	struct bpf_link_primer link_primer;
@@ -3437,8 +3456,10 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	if (!!uaddrs == !!usyms)
 		return -EINVAL;
 
-	if (strict && !(flags & BPF_F_KPROBE_MULTI_INLINE))
+	if (strict && !(flags & BPF_F_KPROBE_MULTI_INLINE)) {
+		bpf_log(log, "Strict flag needs to be used with inline flag.\n");
 		return -EINVAL;
+	}
 
 	if (flags & BPF_F_KPROBE_MULTI_INLINE) {
 		/*
@@ -3446,14 +3467,24 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		 * have just entry probe, so there's no return probe, session
 		 * or override support.
 		 */
-		if (flags & BPF_F_KPROBE_MULTI_RETURN)
+		if (flags & BPF_F_KPROBE_MULTI_RETURN) {
+			bpf_log(log, "Inlined functions can't be attached with return probe.\n");
 			return -EINVAL;
-		if (is_kprobe_session(prog) || prog->kprobe_override)
+		}
+		if (is_kprobe_session(prog) || prog->kprobe_override) {
+			bpf_log(log,
+				"Inlined functions can't be attached with session or override program.\n");
 			return -EINVAL;
-		if (uaddrs)
+		}
+		if (uaddrs) {
+			bpf_log(log,
+				"Inlined functions need to be specified with kprobe_multi.syms.\n");
 			return -EINVAL;
-		if (!IS_ENABLED(CONFIG_KPROBES))
+		}
+		if (!IS_ENABLED(CONFIG_KPROBES)) {
+			bpf_log(log, "Inlined functions need kprobes support.\n");
 			return -EOPNOTSUPP;
+		}
 	}
 
 	cnt = attr->link_create.kprobe_multi.cnt;
@@ -3489,7 +3520,6 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		struct multi_symbols_sort data = {
 			.cookies = cookies,
 		};
-		struct user_syms us;
 
 		err = copy_user_syms(&us, usyms, cnt);
 		if (err)
@@ -3516,6 +3546,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 				.syms_cnt = cnt,
 				.addrs    = addrs,
 				.cookies  = cookies,
+				.log      = log,
 			};
 
 			args_cnt = kvcalloc(cnt, sizeof(*args_cnt), GFP_KERNEL);
@@ -3531,7 +3562,6 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 				cnt = lookup.addrs_cnt;
 		}
 
-		free_user_syms(&us);
 		if (err)
 			goto error;
 	}
@@ -3589,7 +3619,16 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	link->mods_cnt = mods.mods_cnt;
 
 	if (inlines.sites_cnt) {
-		err = inline_sites_register(link, strict);
+		err = inline_sites_register(link, strict, &failed);
+		if (failed && strict) {
+			bpf_log(log,
+				"Function %s has inlined instance that can't be attached, %pS failed with %d.\n",
+				us.syms[failed->sym_idx], failed->kp.addr, err);
+		} else if (failed) {
+			bpf_log(log,
+				"Function %s has no entry and none of its inlined instances can be attached, %pS failed with %d.\n",
+				us.syms[failed->sym_idx], failed->kp.addr, err);
+		}
 		if (err)
 			goto error_modules;
 	}
@@ -3601,6 +3640,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 			goto error_inlines;
 	}
 
+	free_user_syms(&us);
 	return bpf_link_settle(&link_primer);
 
 error_inlines:
@@ -3609,9 +3649,11 @@ error_modules:
 	kprobe_multi_put_modules(link->mods, link->mods_cnt);
 error_cleanup:
 	bpf_link_cleanup(&link_primer);
+	free_user_syms(&us);
 	return err;
 
 error:
+	free_user_syms(&us);
 	kprobe_multi_put_modules(mods.mods, mods.mods_cnt);
 	kfree(mods.mods);
 	kfree(link);
@@ -3622,8 +3664,10 @@ error:
 	return err;
 }
 #else /* !CONFIG_FPROBE */
-int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog,
+				 struct bpf_verifier_log *log)
 {
+	bpf_log(log, "This kernel does not support kprobe multi link.\n");
 	return -EOPNOTSUPP;
 }
 static u64 bpf_kprobe_multi_cookie(struct bpf_run_ctx *ctx)

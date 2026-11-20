@@ -15,6 +15,7 @@ struct array_buffer;
 struct tracer;
 struct dentry;
 struct bpf_prog;
+struct bpf_verifier_log;
 union bpf_attr;
 struct bpf_verifier_log;
 
@@ -795,7 +796,8 @@ int bpf_get_perf_event_info(const struct perf_event *event, u32 *prog_id,
 			    u32 *fd_type, const char **buf,
 			    u64 *probe_offset, u64 *probe_addr,
 			    unsigned long *missed);
-int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
+int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog,
+				 struct bpf_verifier_log *log);
 int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
 int bpf_tracing_multi_attach(struct bpf_prog *prog, const union bpf_attr *attr,
 			     struct bpf_verifier_log *log);
@@ -847,7 +849,8 @@ static inline int bpf_get_perf_event_info(const struct perf_event *event,
 	return -EOPNOTSUPP;
 }
 static inline int
-bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog,
+			     struct bpf_verifier_log *log)
 {
 	return -EOPNOTSUPP;
 }
