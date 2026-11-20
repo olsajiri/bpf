@@ -1318,6 +1318,93 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+/* With strict flag all the inlined instances need to be attached. */
+static void test_inline_strict(void)
+{
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	LIBBPF_OPTS(bpf_link_create_opts, lopts);
+	const char *partial[1] = { INLINE_PARTIAL };
+	const char *syms[1] = { INLINE_INNER };
+	struct kprobe_multi_inline *skel = NULL;
+	unsigned long sites[INLINE_MAX];
+	struct bpf_link *link = NULL;
+	int cnt, saved_error, prog_fd;
+
+	cnt = get_inline_sites(INLINE_INNER, sites, INLINE_MAX);
+	if (cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+	if (!ASSERT_EQ(cnt, 2, "inline_sites_cnt"))
+		return;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	prog_fd = bpf_program__fd(skel->progs.test_kprobe_inline);
+
+	/* strict without inlined */
+	opts.syms = syms;
+	opts.cnt = 1;
+	opts.inlined_strict = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "strict_no_inlined"))
+		goto cleanup;
+	link = NULL;
+	ASSERT_EQ(saved_error, -EINVAL, "strict_no_inlined_error");
+
+	lopts.kprobe_multi.syms = syms;
+	lopts.kprobe_multi.cnt = 1;
+	lopts.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE_STRICT;
+
+	if (!inline_link_fails(prog_fd, BPF_TRACE_KPROBE_MULTI, &lopts, -EINVAL,
+			       "Strict flag needs to be used with inline flag."))
+		goto cleanup;
+
+	/* function with inlined instance that can't be attached */
+	opts.syms = partial;
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "strict_partial"))
+		goto cleanup;
+	link = NULL;
+	ASSERT_EQ(saved_error, -EINVAL, "strict_partial_error");
+
+	lopts.kprobe_multi.syms = partial;
+	lopts.kprobe_multi.flags = BPF_F_KPROBE_MULTI_INLINE | BPF_F_KPROBE_MULTI_INLINE_STRICT;
+
+	if (!inline_link_fails(prog_fd, BPF_TRACE_KPROBE_MULTI, &lopts, -EINVAL,
+			       "Function " INLINE_PARTIAL " has inlined instance that can't "
+			       "be attached, bpf_kprobe_multi_inline_test4+"))
+		goto cleanup;
+
+	/* function with all the inlined instances attached */
+	opts.syms = syms;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "strict_attach")) {
+		link = NULL;
+		goto cleanup;
+	}
+
+	ASSERT_EQ(get_fdinfo_cnt(bpf_link__fd(link), "kprobe_inline_cnt"), cnt,
+		  "kprobe_inline_cnt");
+	ASSERT_EQ(get_fdinfo_cnt(bpf_link__fd(link), "kprobe_inline_skipped"), 0,
+		  "kprobe_inline_skipped");
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 void serial_test_kprobe_multi_bench_attach(void)
 {
 	if (test__start_subtest("kernel"))
@@ -1375,5 +1462,7 @@ void test_kprobe_multi_test(void)
 		test_inline_fails();
 	if (test__start_subtest("inline_module"))
 		test_inline_module();
+	if (test__start_subtest("inline_strict"))
+		test_inline_strict();
 	RUN_TESTS(kprobe_multi_verifier);
 }
