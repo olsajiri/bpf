@@ -272,6 +272,8 @@ extern struct kretprobe_blackpoint kretprobe_blacklist[];
 
 extern int arch_prepare_kprobe(struct kprobe *p);
 extern void arch_arm_kprobe(struct kprobe *p);
+extern void arch_arm_kprobe_nosync(struct kprobe *p);
+extern void arch_arm_kprobes_sync(void);
 extern void arch_disarm_kprobe(struct kprobe *p);
 extern int arch_init_kprobes(void);
 extern void kprobes_inc_nmissed_count(struct kprobe *p);
@@ -423,6 +425,7 @@ void kprobe_free_init_mem(void);
 
 int disable_kprobe(struct kprobe *kp);
 int enable_kprobe(struct kprobe *kp);
+int enable_kprobes(struct kprobe **kps, int num);
 
 void dump_kprobe(struct kprobe *kp);
 
@@ -495,6 +498,10 @@ static inline void kprobe_ftrace_kill(void)
 {
 }
 static inline int disable_kprobe(struct kprobe *kp)
+{
+	return -EOPNOTSUPP;
+}
+static inline int enable_kprobes(struct kprobe **kps, int num)
 {
 	return -EOPNOTSUPP;
 }
