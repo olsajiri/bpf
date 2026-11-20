@@ -2937,20 +2937,21 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	}
 
 	err = get_modules_for_addrs(&link->mods, addrs, cnt);
-	if (err < 0) {
-		bpf_link_cleanup(&link_primer);
-		return err;
-	}
+	if (err < 0)
+		goto error_cleanup;
 	link->mods_cnt = err;
 
 	err = register_fprobe_ips(&link->fp, addrs, cnt);
-	if (err) {
-		kprobe_multi_put_modules(link->mods, link->mods_cnt);
-		bpf_link_cleanup(&link_primer);
-		return err;
-	}
+	if (err)
+		goto error_modules;
 
 	return bpf_link_settle(&link_primer);
+
+error_modules:
+	kprobe_multi_put_modules(link->mods, link->mods_cnt);
+error_cleanup:
+	bpf_link_cleanup(&link_primer);
+	return err;
 
 error:
 	kfree(link);
