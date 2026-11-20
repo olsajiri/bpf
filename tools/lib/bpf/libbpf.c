@@ -13160,8 +13160,10 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	const unsigned long *addrs;
 	int err, link_fd, prog_fd;
 	bool retprobe, session, unique_match, inlined, inlined_strict;
+	LIBBPF_OPTS(bpf_log_opts, log_opts);
 	const __u64 *cookies;
 	const char **syms;
+	char log_buf[4096];
 	size_t cnt;
 
 	if (!OPTS_VALID(opts, bpf_kprobe_multi_opts))
@@ -13249,6 +13251,13 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 	if (inlined_strict)
 		lopts.kprobe_multi.flags |= BPF_F_KPROBE_MULTI_INLINE_STRICT;
 
+	/* Get the reason of the attach failure from kernel if it's supported. */
+	log_buf[0] = '\0';
+	log_opts.buf = log_buf;
+	log_opts.size = sizeof(log_buf);
+	log_opts.level = 1;
+	lopts.log_opts = &log_opts;
+
 	link = calloc(1, sizeof(*link));
 	if (!link) {
 		err = -ENOMEM;
@@ -13269,6 +13278,8 @@ bpf_program__attach_kprobe_multi_opts(const struct bpf_program *prog,
 			err = -ENOENT;
 		pr_warn("prog '%s': failed to attach: %s\n",
 			prog->name, errstr(err));
+		if (log_buf[0])
+			pr_warn("prog '%s': %s\n", prog->name, log_buf);
 		goto error;
 	}
 	link->fd = link_fd;
