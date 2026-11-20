@@ -141,6 +141,23 @@ config KPROBES
 	  for kernel debugging, non-intrusive instrumentation and testing.
 	  If in doubt, say "N".
 
+config KPROBE_HASH_BITS
+	int "Kprobe hash table size in bits" if EXPERT
+	depends on KPROBES
+	range 6 16
+	default 10 if DEBUG_INFO_BTF_INLINE
+	default 6
+	help
+	  Size of the kprobe hash table as a power of two. The default
+	  of 6 (64 buckets) is enough for a small number of probes.
+
+	  Attaching to inlined functions can register thousands of
+	  kprobes at once, so the default is raised to 10 (1024 buckets,
+	  8KB on 64-bit) when the inline site information is available
+	  (DEBUG_INFO_BTF_INLINE).
+
+	  If in doubt, keep the default.
+
 config JUMP_LABEL
 	bool "Optimize very unlikely/likely branches"
 	depends on HAVE_ARCH_JUMP_LABEL
