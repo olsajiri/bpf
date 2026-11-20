@@ -1283,8 +1283,22 @@ static bool kprobe_queued_unopt(struct kprobe *p)
 	return false;
 }
 
+/*
+ * Architectures can put the breakpoint without waiting for other CPUs
+ * in arch_arm_kprobe_nosync() and do the wait for all the breakpoints
+ * at once in arch_arm_kprobes_sync().
+ */
+void __weak arch_arm_kprobe_nosync(struct kprobe *p)
+{
+	arch_arm_kprobe(p);
+}
+
+void __weak arch_arm_kprobes_sync(void)
+{
+}
+
 /* Put a breakpoint for a probe. */
-static void __arm_kprobe(struct kprobe *p)
+static void __arm_kprobe(struct kprobe *p, bool sync)
 {
 	struct kprobe *_p;
 
@@ -1296,8 +1310,12 @@ static void __arm_kprobe(struct kprobe *p)
 		/* Fallback to unoptimized kprobe */
 		unoptimize_kprobe(_p, true);
 
-	if (!kprobe_queued_unopt(p))
-		arch_arm_kprobe(p);
+	if (!kprobe_queued_unopt(p)) {
+		if (sync)
+			arch_arm_kprobe(p);
+		else
+			arch_arm_kprobe_nosync(p);
+	}
 	optimize_kprobe(p);	/* Try to optimize (add kprobe to a list) */
 	if (unlikely(kprobe_queued_unopt(p)))
 		unoptimize_kprobe(p, true);
@@ -1354,7 +1372,8 @@ static void __init init_optprobe(void)
 #define kill_optimized_kprobe(p)		do {} while (0)
 #define prepare_optimized_kprobe(p)		do {} while (0)
 #define try_to_optimize_kprobe(p)		do {} while (0)
-#define __arm_kprobe(p)				arch_arm_kprobe(p)
+#define __arm_kprobe(p, sync)			\
+	((sync) ? arch_arm_kprobe(p) : arch_arm_kprobe_nosync(p))
 #define __disarm_kprobe(p, o)			arch_disarm_kprobe(p)
 #define kprobe_disarmed(p)			kprobe_disabled(p)
 #define wait_for_kprobe_optimizer_locked()			\
@@ -1506,7 +1525,7 @@ static int arm_kprobe(struct kprobe *kp)
 
 	guard(cpus_read_lock)();
 	guard(mutex)(&text_mutex);
-	__arm_kprobe(kp);
+	__arm_kprobe(kp, true);
 	return 0;
 }
 
@@ -2804,6 +2823,83 @@ int enable_kprobe(struct kprobe *kp)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(enable_kprobe);
+
+/*
+ * Enable @num kprobes in @kps. The breakpoints are installed for all
+ * of them first and other CPUs are synced just once at the end, instead
+ * of once per kprobe as enable_kprobe() does.
+ *
+ * On error some of the kprobes might be already enabled.
+ */
+int enable_kprobes(struct kprobe **kps, int num)
+{
+	struct kprobe *kp, *p;
+	bool armed = false;
+	int i, ret;
+
+	if (num <= 0)
+		return -EINVAL;
+
+	guard(mutex)(&kprobe_mutex);
+
+	/*
+	 * The ftrace based kprobes can't be armed under text_mutex,
+	 * enable them first one by one.
+	 */
+	for (i = 0; i < num; i++) {
+		kp = kps[i];
+
+		/* Check whether specified probe is valid. */
+		p = __get_valid_kprobe(kp);
+		if (unlikely(p == NULL))
+			return -EINVAL;
+
+		if (kprobe_gone(kp))
+			/* This kprobe has gone, we couldn't enable it. */
+			return -EINVAL;
+
+		if (likely(!kprobe_ftrace(p)))
+			continue;
+
+		if (p != kp)
+			kp->flags &= ~KPROBE_FLAG_DISABLED;
+
+		if (!kprobes_all_disarmed && kprobe_disabled(p)) {
+			p->flags &= ~KPROBE_FLAG_DISABLED;
+			ret = arm_kprobe(p);
+			if (ret) {
+				p->flags |= KPROBE_FLAG_DISABLED;
+				if (p != kp)
+					kp->flags |= KPROBE_FLAG_DISABLED;
+				return ret;
+			}
+		}
+	}
+
+	guard(cpus_read_lock)();
+	guard(mutex)(&text_mutex);
+
+	for (i = 0; i < num; i++) {
+		kp = kps[i];
+		p = __get_valid_kprobe(kp);
+		if (kprobe_ftrace(p))
+			continue;
+
+		if (p != kp)
+			kp->flags &= ~KPROBE_FLAG_DISABLED;
+
+		if (!kprobes_all_disarmed && kprobe_disabled(p)) {
+			p->flags &= ~KPROBE_FLAG_DISABLED;
+			__arm_kprobe(p, false);
+			armed = true;
+		}
+	}
+
+	if (armed)
+		arch_arm_kprobes_sync();
+	return 0;
+}
+EXPORT_SYMBOL_GPL(enable_kprobes);
 
 /* Caller must NOT call this in usual path. This is only for critical case */
 void dump_kprobe(struct kprobe *kp)
