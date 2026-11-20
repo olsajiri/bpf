@@ -514,6 +514,7 @@ static void do_bench_test(struct kprobe_multi_empty *skel, struct bpf_kprobe_mul
 	long detach_start_ns, detach_end_ns;
 	double attach_delta, detach_delta;
 	struct bpf_link *link = NULL;
+	long inline_cnt = 0, inline_skipped = 0;
 
 	attach_start_ns = get_time_ns();
 	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_empty,
@@ -523,6 +524,11 @@ static void do_bench_test(struct kprobe_multi_empty *skel, struct bpf_kprobe_mul
 	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
 		return;
 
+	if (opts->inlined) {
+		inline_cnt = get_fdinfo_cnt(bpf_link__fd(link), "kprobe_inline_cnt");
+		inline_skipped = get_fdinfo_cnt(bpf_link__fd(link), "kprobe_inline_skipped");
+	}
+
 	detach_start_ns = get_time_ns();
 	bpf_link__destroy(link);
 	detach_end_ns = get_time_ns();
@@ -531,6 +537,10 @@ static void do_bench_test(struct kprobe_multi_empty *skel, struct bpf_kprobe_mul
 	detach_delta = (detach_end_ns - detach_start_ns) / 1000000000.0;
 
 	printf("%s: found %lu functions\n", __func__, opts->cnt);
+	if (opts->inlined) {
+		printf("%s: attached %ld inlined instances, skipped %ld\n", __func__,
+		       inline_cnt, inline_skipped);
+	}
 	printf("%s: attached in %7.3lfs\n", __func__, attach_delta);
 	printf("%s: detached in %7.3lfs\n", __func__, detach_delta);
 }
@@ -550,6 +560,37 @@ static void test_kprobe_multi_bench_attach(bool kernel)
 
 	opts.syms = (const char **)ksyms->filtered_syms;
 	opts.cnt = ksyms->filtered_cnt;
+
+	do_bench_test(skel, &opts);
+
+cleanup:
+	kprobe_multi_empty__destroy(skel);
+	free_kallsyms_local(ksyms);
+}
+
+/* Attach all attachable functions together with their inlined instances. */
+static void test_kprobe_multi_bench_attach_inline(bool kernel)
+{
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	struct kprobe_multi_empty *skel = NULL;
+	struct ksyms *ksyms = NULL;
+
+	/* pahole may not have inline BTF feature support. */
+	if (access("/sys/kernel/btf/vmlinux.inline", F_OK)) {
+		test__skip();
+		return;
+	}
+
+	if (!ASSERT_OK(bpf_get_ksyms(&ksyms, kernel), "bpf_get_ksyms"))
+		return;
+
+	skel = kprobe_multi_empty__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_empty__open_and_load"))
+		goto cleanup;
+
+	opts.syms = (const char **)ksyms->filtered_syms;
+	opts.cnt = ksyms->filtered_cnt;
+	opts.inlined = true;
 
 	do_bench_test(skel, &opts);
 
@@ -1565,6 +1606,10 @@ void serial_test_kprobe_multi_bench_attach(void)
 		test_kprobe_multi_bench_attach_addr(true);
 	if (test__start_subtest("modules"))
 		test_kprobe_multi_bench_attach_addr(false);
+	if (test__start_subtest("kernel_inline"))
+		test_kprobe_multi_bench_attach_inline(true);
+	if (test__start_subtest("modules_inline"))
+		test_kprobe_multi_bench_attach_inline(false);
 }
 
 void test_kprobe_multi_test(void)
