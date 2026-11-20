@@ -487,6 +487,27 @@ static void test_unique_match(void)
 	kprobe_multi__destroy(skel);
 }
 
+/* Get value of the @name counter from fdinfo of kprobe multi link. */
+static long get_fdinfo_cnt(int link_fd, const char *name)
+{
+	char path[64], buf[256], fmt[64];
+	long cnt = -1;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", link_fd);
+	f = fopen(path, "r");
+	if (!ASSERT_OK_PTR(f, "open_fdinfo"))
+		return -1;
+
+	snprintf(fmt, sizeof(fmt), "%s:\t%%ld", name);
+	while (fgets(buf, sizeof(buf), f)) {
+		if (sscanf(buf, fmt, &cnt) == 1)
+			break;
+	}
+	fclose(f);
+	return cnt;
+}
+
 static void do_bench_test(struct kprobe_multi_empty *skel, struct bpf_kprobe_multi_opts *opts)
 {
 	long attach_start_ns, attach_end_ns;
@@ -946,6 +967,87 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+#define INLINE_PARTIAL		"bpf_kprobe_multi_inline_partial"
+#define INLINE_PARTIAL_CALLER	"bpf_kprobe_multi_inline_test3"
+#define INLINE_NOKPROBE		"bpf_kprobe_multi_inline_nokprobe"
+
+/* Inlined instances that can't be attached are skipped. */
+static void test_inline_skip(void)
+{
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	const char *syms[1] = { INLINE_PARTIAL };
+	const char *nosyms[1] = { INLINE_NOKPROBE };
+	struct kprobe_multi_inline *skel = NULL;
+	unsigned long sites[INLINE_MAX];
+	struct bpf_link *link = NULL;
+	__u64 cookies[1] = { 8 };
+	int cnt, i, saved_error;
+	struct ksym *ksym;
+	bool attached;
+
+	cnt = get_inline_sites(INLINE_PARTIAL, sites, INLINE_MAX);
+	if (cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+
+	/* One instance in function that kprobes can attach and one that can't. */
+	if (!ASSERT_EQ(cnt, 2, "inline_sites_cnt"))
+		return;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->pid = getpid();
+
+	opts.syms = syms;
+	opts.cookies = cookies;
+	opts.cnt = ARRAY_SIZE(syms);
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
+		goto cleanup;
+
+	ASSERT_EQ(get_fdinfo_cnt(bpf_link__fd(link), "kprobe_inline_cnt"), 1,
+		  "kprobe_inline_cnt");
+	ASSERT_EQ(get_fdinfo_cnt(bpf_link__fd(link), "kprobe_inline_skipped"), 1,
+		  "kprobe_inline_skipped");
+
+	inline_trigger(skel);
+
+	/* Only the instance outside of the nokprobe function is hit. */
+	ASSERT_EQ(skel->bss->hits_cnt, 1, "hits_cnt");
+
+	for (i = 0; i < cnt; i++) {
+		ksym = ksym_search(sites[i]);
+		if (!ASSERT_OK_PTR(ksym, "ksym_search"))
+			continue;
+		attached = !strcmp(ksym->name, INLINE_PARTIAL_CALLER);
+		ASSERT_EQ(inline_hits(skel, sites[i], 8), attached ? 1 : 0, "inline_site_hit");
+	}
+
+	bpf_link__destroy(link);
+
+	/* Function with no entry and all inlined instances skipped fails to attach. */
+	opts.syms = nosyms;
+	opts.cookies = NULL;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline,
+						     NULL, &opts);
+	saved_error = -errno;
+	if (!ASSERT_ERR_PTR(link, "attach_nokprobe"))
+		goto cleanup;
+	link = NULL;
+	ASSERT_EQ(saved_error, -EINVAL, "attach_nokprobe_error");
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 void serial_test_kprobe_multi_bench_attach(void)
 {
 	if (test__start_subtest("kernel"))
@@ -997,5 +1099,7 @@ void test_kprobe_multi_test(void)
 		test_inline(true);
 	if (test__start_subtest("inline_mixed"))
 		test_inline_mixed();
+	if (test__start_subtest("inline_skip"))
+		test_inline_skip();
 	RUN_TESTS(kprobe_multi_verifier);
 }
