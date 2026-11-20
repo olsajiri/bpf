@@ -2676,7 +2676,7 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 			   unsigned long entry_ip, struct ftrace_regs *fregs,
-			   bool is_return, void *data)
+			   struct pt_regs *regs, bool is_return, void *data)
 {
 	struct bpf_kprobe_multi_run_ctx run_ctx = {
 		.session_ctx = {
@@ -2687,7 +2687,6 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 		.entry_ip = entry_ip,
 	};
 	struct bpf_run_ctx *old_run_ctx;
-	struct pt_regs *regs;
 	int err;
 
 	/*
@@ -2704,11 +2703,13 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 	}
 
 	rcu_read_lock();
-	regs = ftrace_partial_regs(fregs, bpf_kprobe_multi_pt_regs_ptr());
+	/* The caller provides either ftrace_regs or pt_regs. */
+	regs = regs ?: ftrace_partial_regs(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	old_run_ctx = bpf_set_run_ctx(&run_ctx.session_ctx.run_ctx);
 	err = bpf_prog_run(link->link.prog, regs);
 	bpf_reset_run_ctx(old_run_ctx);
-	ftrace_partial_regs_update(fregs, bpf_kprobe_multi_pt_regs_ptr());
+	if (fregs)
+		ftrace_partial_regs_update(fregs, bpf_kprobe_multi_pt_regs_ptr());
 	rcu_read_unlock();
 
  out:
@@ -2726,7 +2727,7 @@ kprobe_multi_link_handler(struct fprobe *fp, unsigned long fentry_ip,
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
 	err = kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
-					 fregs, false, data);
+					 fregs, NULL, false, data);
 	return is_kprobe_session(link->link.prog) ? err : 0;
 }
 
@@ -2739,7 +2740,7 @@ kprobe_multi_link_exit_handler(struct fprobe *fp, unsigned long fentry_ip,
 
 	link = container_of(fp, struct bpf_kprobe_multi_link, fp);
 	kprobe_multi_link_prog_run(link, ftrace_get_entry_ip(fentry_ip),
-				   fregs, true, data);
+				   fregs, NULL, true, data);
 }
 
 static int symbols_cmp_r(const void *a, const void *b, const void *priv)
