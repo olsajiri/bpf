@@ -3228,7 +3228,8 @@ error:
 	return err;
 }
 
-int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog,
+				 struct bpf_verifier_log *log)
 {
 	struct inline_sites inlines = {};
 	struct modules_array mods = {};
@@ -3447,8 +3448,10 @@ error:
 	return err;
 }
 #else /* !CONFIG_FPROBE */
-int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *prog,
+				 struct bpf_verifier_log *log)
 {
+	bpf_log(log, "This kernel does not support kprobe multi link.\n");
 	return -EOPNOTSUPP;
 }
 static u64 bpf_kprobe_multi_cookie(struct bpf_run_ctx *ctx)
