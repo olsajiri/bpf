@@ -3125,8 +3125,11 @@ error:
  *
  * The instances are sorted by function, so we can check that when we
  * get to the last instance of the function.
+ *
+ * With @strict nothing is skipped, the first instance that fails to
+ * register fails the link with its error.
  */
-static int inline_sites_register(struct bpf_kprobe_multi_link *link)
+static int inline_sites_register(struct bpf_kprobe_multi_link *link, bool strict)
 {
 	struct inline_sites *inlines = &link->inlines;
 	struct inline_site *site, *first = NULL;
@@ -3151,6 +3154,8 @@ static int inline_sites_register(struct bpf_kprobe_multi_link *link)
 
 		err = register_kprobe(&site->kp);
 		if (err == -ENOMEM)
+			goto error;
+		if (err && strict)
 			goto error;
 		if (err) {
 			first_err = first_err ?: err;
@@ -3195,6 +3200,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	void __user *uaddrs;
 	u64 *cookies = NULL;
 	void __user *usyms;
+	bool strict;
 	int err;
 
 	/* no support for 32bit archs yet */
@@ -3216,12 +3222,17 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		return -EINVAL;
 
 	flags = attr->link_create.kprobe_multi.flags;
-	if (flags & ~(BPF_F_KPROBE_MULTI_RETURN | BPF_F_KPROBE_MULTI_INLINE))
+	if (flags & ~(BPF_F_KPROBE_MULTI_RETURN | BPF_F_KPROBE_MULTI_INLINE |
+		      BPF_F_KPROBE_MULTI_INLINE_STRICT))
 		return -EINVAL;
+	strict = flags & BPF_F_KPROBE_MULTI_INLINE_STRICT;
 
 	uaddrs = u64_to_user_ptr(attr->link_create.kprobe_multi.addrs);
 	usyms = u64_to_user_ptr(attr->link_create.kprobe_multi.syms);
 	if (!!uaddrs == !!usyms)
+		return -EINVAL;
+
+	if (strict && !(flags & BPF_F_KPROBE_MULTI_INLINE))
 		return -EINVAL;
 
 	if (flags & BPF_F_KPROBE_MULTI_INLINE) {
@@ -3364,7 +3375,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	link->mods_cnt = mods.mods_cnt;
 
 	if (inlines.sites_cnt) {
-		err = inline_sites_register(link);
+		err = inline_sites_register(link, strict);
 		if (err)
 			goto error_modules;
 	}
