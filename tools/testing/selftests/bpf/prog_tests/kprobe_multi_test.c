@@ -1201,6 +1201,156 @@ cleanup:
 	kprobe_multi_inline__destroy(skel);
 }
 
+#define INLINE_ARGS		"bpf_kprobe_multi_inline_args"
+#define TESTMOD_INLINE_ARGS	"bpf_testmod_kprobe_multi_inline_args"
+#define INLINE_ARGS_CNT		3
+
+/*
+ * The probe on @ip must be hit just once and see @exp arguments,
+ * anything above that needs to fail.
+ */
+static void inline_check_args(struct kprobe_multi_inline *skel, unsigned long ip,
+			      const __u64 *exp)
+{
+	int i, idx = -1;
+
+	if (!ASSERT_EQ(inline_hits(skel, ip, 0), 1, "args_hit"))
+		return;
+
+	for (i = 0; i < skel->bss->hits_cnt; i++) {
+		if (skel->bss->hits_ip[i] == ip)
+			idx = i;
+	}
+
+	ASSERT_EQ(skel->bss->args_cnt[idx], INLINE_ARGS_CNT, "args_cnt");
+
+	for (i = 0; i < INLINE_ARGS_CNT; i++) {
+		ASSERT_OK(skel->bss->args_err[idx][i], "args_err");
+		/* The arguments have different sizes, check the lower part. */
+		ASSERT_EQ((__u32)skel->bss->args_val[idx][i], (__u32)exp[i], "args_val");
+	}
+
+	ASSERT_EQ(skel->bss->args_err[idx][i], -EINVAL, "args_err_last");
+}
+
+/*
+ * Get arguments of inlined function and of function with entry probe
+ * in single link, and make sure it fails for link without inline flag.
+ */
+static void test_inline_args(void)
+{
+	const char *syms[2] = { INLINE_ARGS, "bpf_fentry_test3" };
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	struct kprobe_multi_inline *skel = NULL;
+	__u64 exp_entry[INLINE_ARGS_CNT] = { 4, 5, 6 };
+	__u64 exp[INLINE_ARGS_CNT] = { 1, 2, 3 };
+	struct bpf_link *link = NULL;
+	unsigned long sites[INLINE_MAX], addr;
+	int cnt, i;
+
+	cnt = get_inline_sites(INLINE_ARGS, sites, INLINE_MAX);
+	if (cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+	if (!ASSERT_EQ(cnt, 1, "sites_cnt"))
+		return;
+
+	addr = ksym_get_addr("bpf_fentry_test3");
+	if (!ASSERT_NEQ(addr, 0, "bpf_fentry_test3_addr"))
+		return;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->pid = getpid();
+
+	opts.syms = syms;
+	opts.cnt = ARRAY_SIZE(syms);
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline_args,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
+		goto cleanup;
+
+	inline_trigger(skel);
+
+	ASSERT_EQ(skel->bss->hits_cnt, 2, "hits_cnt");
+	inline_check_args(skel, sites[0], exp);
+	inline_check_args(skel, addr, exp_entry);
+
+	bpf_link__destroy(link);
+
+	/* There's no arguments support without inline flag. */
+	opts.syms = &syms[1];
+	opts.cnt = 1;
+	opts.inlined = false;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline_args,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
+		goto cleanup;
+
+	inline_trigger(skel);
+
+	if (!ASSERT_EQ(skel->bss->hits_cnt, 1, "hits_cnt"))
+		goto cleanup;
+	ASSERT_EQ(skel->bss->args_cnt[0], 0, "args_cnt");
+	for (i = 0; i < INLINE_ARGS_CNT; i++)
+		ASSERT_EQ(skel->bss->args_err[0][i], -EOPNOTSUPP, "args_err");
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
+/* Get arguments of function inlined in module. */
+static void test_inline_args_module(void)
+{
+	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
+	const char *syms[1] = { TESTMOD_INLINE_ARGS };
+	struct kprobe_multi_inline *skel = NULL;
+	__u64 exp[INLINE_ARGS_CNT] = { 1, 2, 3 };
+	struct bpf_link *link = NULL;
+	unsigned long sites[INLINE_MAX];
+	int cnt;
+
+	cnt = get_testmod_inline_sites(TESTMOD_INLINE_ARGS, sites, INLINE_MAX);
+	if (cnt == -ENOENT) {
+		test__skip();
+		return;
+	}
+	if (!ASSERT_EQ(cnt, 1, "sites_cnt"))
+		return;
+
+	skel = kprobe_multi_inline__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "kprobe_multi_inline__open_and_load"))
+		return;
+
+	skel->bss->pid = getpid();
+
+	opts.syms = syms;
+	opts.cnt = ARRAY_SIZE(syms);
+	opts.inlined = true;
+
+	link = bpf_program__attach_kprobe_multi_opts(skel->progs.test_kprobe_inline_args,
+						     NULL, &opts);
+	if (!ASSERT_OK_PTR(link, "bpf_program__attach_kprobe_multi_opts"))
+		goto cleanup;
+
+	skel->bss->hits_cnt = 0;
+	ASSERT_OK(trigger_module_test_read(1), "trigger_read");
+
+	ASSERT_EQ(skel->bss->hits_cnt, 1, "hits_cnt");
+	inline_check_args(skel, sites[0], exp);
+
+cleanup:
+	bpf_link__destroy(link);
+	kprobe_multi_inline__destroy(skel);
+}
+
 /*
  * Make sure the link create fails with @error and kernel explains
  * the failure with @msg in the log.
@@ -1509,5 +1659,9 @@ void test_kprobe_multi_test(void)
 		test_inline_module();
 	if (test__start_subtest("inline_strict"))
 		test_inline_strict();
+	if (test__start_subtest("inline_args"))
+		test_inline_args();
+	if (test__start_subtest("inline_args_module"))
+		test_inline_args_module();
 	RUN_TESTS(kprobe_multi_verifier);
 }
