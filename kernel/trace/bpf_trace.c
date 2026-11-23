@@ -2662,6 +2662,11 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 	return run_ctx->entry_ip;
 }
 
+int __weak bpf_arch_dwarf_regval(struct pt_regs *regs, u32 regno, u64 *value)
+{
+	return -EOPNOTSUPP;
+}
+
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 			   struct inline_site *site,
