@@ -622,6 +622,18 @@ noinline int bpf_kprobe_multi_inline_test4(int a)
 }
 NOKPROBE_SYMBOL(bpf_kprobe_multi_inline_test4);
 
+/* Inlined function with arguments for kprobe multi inline args test. */
+static __always_inline long bpf_kprobe_multi_inline_args(int a, long b, void *c)
+{
+	asm volatile("nop");
+	return a + b + (long)c;
+}
+
+noinline long bpf_kprobe_multi_inline_test5(int a, long b, void *c)
+{
+	return bpf_kprobe_multi_inline_args(a, b, c);
+}
+
 noinline void bpf_fentry_test_sinfo(struct skb_shared_info *sinfo)
 {
 }
@@ -778,7 +790,8 @@ int bpf_prog_test_run_tracing(struct bpf_prog *prog,
 		    bpf_kprobe_multi_inline_test1(1) != 3 ||
 		    bpf_kprobe_multi_inline_test2(1) != 2 ||
 		    bpf_kprobe_multi_inline_test3(1) != 2 ||
-		    bpf_kprobe_multi_inline_test4(1) != 5)
+		    bpf_kprobe_multi_inline_test4(1) != 5 ||
+		    bpf_kprobe_multi_inline_test5(1, 2, (void *)3) != 6)
 			goto out;
 		break;
 	case BPF_MODIFY_RETURN:
