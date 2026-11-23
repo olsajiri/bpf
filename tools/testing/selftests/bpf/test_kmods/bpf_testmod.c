@@ -179,6 +179,18 @@ noinline int bpf_testmod_kprobe_multi_inline_test(int a)
 	return bpf_testmod_kprobe_multi_inline(a);
 }
 
+/* Inlined function with arguments for kprobe multi inline args test. */
+static __always_inline long bpf_testmod_kprobe_multi_inline_args(int a, long b, void *c)
+{
+	asm volatile("nop");
+	return a + b + (long)c;
+}
+
+noinline long bpf_testmod_kprobe_multi_inline_args_test(int a, long b, void *c)
+{
+	return bpf_testmod_kprobe_multi_inline_args(a, b, c);
+}
+
 noinline int
 bpf_testmod_test_arg_ptr_to_struct(struct bpf_testmod_struct_arg_1 *a) {
 	bpf_testmod_test_struct_arg_result = a->a;
@@ -827,6 +839,7 @@ bpf_testmod_test_read(struct file *file, struct kobject *kobj,
 	(void)bpf_testmod_test_arg_ptr_to_struct(&struct_arg1_2);
 
 	(void)bpf_testmod_kprobe_multi_inline_test(1);
+	(void)bpf_testmod_kprobe_multi_inline_args_test(1, 2, (void *)3);
 
 #ifdef __SIZEOF_INT128__
 	(void)bpf_testmod_test_int128_ret(i);
