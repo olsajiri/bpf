@@ -5682,9 +5682,14 @@ union bpf_attr {
  *		Get **n**-th argument register (zero based) of the traced function (for tracing programs)
  *		returned in **value**.
  *
+ *		For kprobe multi programs attached with **BPF_F_KPROBE_MULTI_INLINE**
+ *		flag get **n**-th argument (zero based) of the traced function.
+ *
  *	Return
  *		0 on success.
  *		**-EINVAL** if n >= argument register count of traced function.
+ *		**-EOPNOTSUPP** for kprobe multi programs attached without
+ *		**BPF_F_KPROBE_MULTI_INLINE** flag or for inlined instances.
  *
  * long bpf_get_func_ret(void *ctx, u64 *value)
  *	Description
@@ -5700,8 +5705,13 @@ union bpf_attr {
  *		Get number of registers of the traced function (for tracing programs) where
  *		function arguments are stored in these registers.
  *
+ *		For kprobe multi programs attached with **BPF_F_KPROBE_MULTI_INLINE**
+ *		flag get number of arguments of the traced function.
+ *
  *	Return
  *		The number of argument registers of the traced function.
+ *		0 for kprobe multi programs attached without
+ *		**BPF_F_KPROBE_MULTI_INLINE** flag or for inlined instances.
  *
  * int bpf_get_retval(void)
  *	Description

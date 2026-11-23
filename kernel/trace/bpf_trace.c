@@ -1358,6 +1358,11 @@ static inline bool is_trace_fsession(const struct bpf_prog *prog)
 		prog->expected_attach_type == BPF_TRACE_FSESSION_MULTI);
 }
 
+#ifdef CONFIG_FPROBE
+static const struct bpf_func_proto bpf_get_func_arg_proto_kprobe_multi;
+static const struct bpf_func_proto bpf_get_func_arg_cnt_proto_kprobe_multi;
+#endif
+
 static const struct bpf_func_proto *
 kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
@@ -1384,6 +1389,12 @@ kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		if (is_uprobe_multi(prog))
 			return &bpf_get_attach_cookie_proto_umulti;
 		return &bpf_get_attach_cookie_proto_trace;
+#ifdef CONFIG_FPROBE
+	case BPF_FUNC_get_func_arg:
+		return is_kprobe_multi(prog) ? &bpf_get_func_arg_proto_kprobe_multi : NULL;
+	case BPF_FUNC_get_func_arg_cnt:
+		return is_kprobe_multi(prog) ? &bpf_get_func_arg_cnt_proto_kprobe_multi : NULL;
+#endif
 	default:
 		return bpf_tracing_func_proto(func_id, prog);
 	}
@@ -2392,6 +2403,8 @@ struct bpf_kprobe_multi_link {
 	struct fprobe fp;
 	unsigned long *addrs;
 	u64 *cookies;
+	/* Number of arguments for functions in @addrs, inline link only. */
+	u8 *args_cnt;
 	u32 cnt;
 	u32 mods_cnt;
 	struct module **mods;
@@ -2403,6 +2416,7 @@ struct bpf_kprobe_multi_run_ctx {
 	struct bpf_kprobe_multi_link *link;
 	unsigned long entry_ip;
 	struct inline_site *site;
+	struct ftrace_regs *fregs;
 };
 
 struct user_syms {
@@ -2512,6 +2526,7 @@ static void bpf_kprobe_multi_link_dealloc(struct bpf_link *link)
 	kvfree(kmulti_link->inlines.kps);
 	kvfree(kmulti_link->addrs);
 	kvfree(kmulti_link->cookies);
+	kvfree(kmulti_link->args_cnt);
 	kfree(kmulti_link->mods);
 	kfree(kmulti_link);
 }
@@ -2610,14 +2625,15 @@ static void bpf_kprobe_multi_cookie_swap(void *a, void *b, int size, const void 
 {
 	const struct bpf_kprobe_multi_link *link = priv;
 	unsigned long *addr_a = a, *addr_b = b;
-	u64 *cookie_a, *cookie_b;
+	u32 idx_a = addr_a - link->addrs;
+	u32 idx_b = addr_b - link->addrs;
 
-	cookie_a = link->cookies + (addr_a - link->addrs);
-	cookie_b = link->cookies + (addr_b - link->addrs);
-
-	/* swap addr_a/addr_b and cookie_a/cookie_b values */
+	/* swap addr_a/addr_b and related cookie and args_cnt values */
 	swap(*addr_a, *addr_b);
-	swap(*cookie_a, *cookie_b);
+	if (link->cookies)
+		swap(link->cookies[idx_a], link->cookies[idx_b]);
+	if (link->args_cnt)
+		swap(link->args_cnt[idx_a], link->args_cnt[idx_b]);
 }
 
 static int bpf_kprobe_multi_addrs_cmp(const void *a, const void *b)
@@ -2668,6 +2684,75 @@ static u64 bpf_kprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 	return run_ctx->entry_ip;
 }
 
+/*
+ * Get number of arguments of the function we got executed for
+ * through its entry probe.
+ */
+static int kprobe_multi_entry_args_cnt(struct bpf_kprobe_multi_run_ctx *run_ctx)
+{
+	struct bpf_kprobe_multi_link *link = run_ctx->link;
+	unsigned long entry_ip = run_ctx->entry_ip;
+	unsigned long *addr;
+
+	if (!link->args_cnt)
+		return -EOPNOTSUPP;
+	addr = bsearch(&entry_ip, link->addrs, link->cnt, sizeof(entry_ip),
+		       bpf_kprobe_multi_addrs_cmp);
+	if (!addr)
+		return -EOPNOTSUPP;
+	return link->args_cnt[addr - link->addrs];
+}
+
+BPF_CALL_3(bpf_get_func_arg_kprobe_multi, struct pt_regs *, regs, u32, n, u64 *, value)
+{
+	struct bpf_kprobe_multi_run_ctx *run_ctx;
+	int cnt;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
+			       session_ctx.run_ctx);
+	/* Arguments of inlined instances are not supported. */
+	if (run_ctx->site)
+		return -EOPNOTSUPP;
+
+	cnt = kprobe_multi_entry_args_cnt(run_ctx);
+	if (cnt < 0)
+		return cnt;
+	if (n >= cnt)
+		return -EINVAL;
+	*value = ftrace_regs_get_argument(run_ctx->fregs, n);
+	return 0;
+}
+
+static const struct bpf_func_proto bpf_get_func_arg_proto_kprobe_multi = {
+	.func		= bpf_get_func_arg_kprobe_multi,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_WRITE | MEM_ALIGNED,
+	.arg3_size	= sizeof(u64),
+};
+
+BPF_CALL_1(bpf_get_func_arg_cnt_kprobe_multi, struct pt_regs *, regs)
+{
+	struct bpf_kprobe_multi_run_ctx *run_ctx;
+	int cnt;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
+			       session_ctx.run_ctx);
+	/* Arguments of inlined instances are not supported. */
+	if (run_ctx->site)
+		return 0;
+
+	cnt = kprobe_multi_entry_args_cnt(run_ctx);
+	return cnt < 0 ? 0 : cnt;
+}
+
+static const struct bpf_func_proto bpf_get_func_arg_cnt_proto_kprobe_multi = {
+	.func		= bpf_get_func_arg_cnt_kprobe_multi,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+};
+
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 			   struct inline_site *site,
@@ -2682,6 +2767,7 @@ kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 		.link = link,
 		.entry_ip = entry_ip,
 		.site = site,
+		.fregs = fregs,
 	};
 	struct bpf_run_ctx *old_run_ctx;
 	int err;
@@ -2905,6 +2991,7 @@ struct inline_lookup {
 	const char **syms;
 	unsigned long *addrs;
 	u64 *cookies;
+	u8 *args_cnt;
 	u32 syms_cnt;
 
 	/* Output */
@@ -3016,6 +3103,27 @@ static int inline_lookup_modules(struct inline_lookup *lookup)
 }
 #endif
 
+/* Get number of arguments of the function from its BTF, zero if there's none. */
+static u8 func_args_cnt(const char *name)
+{
+	const struct btf_type *t;
+	struct btf *btf;
+	u32 cnt = 0;
+	s32 id;
+
+	id = bpf_find_btf_id(name, BTF_KIND_FUNC, &btf);
+	if (id < 0)
+		return 0;
+	t = btf_type_by_id(btf, btf_type_by_id(btf, id)->type);
+	if (btf_type_is_func_proto(t))
+		cnt = btf_type_vlen(t);
+	/* Do not count variable arguments. */
+	if (cnt && !btf_params(t)[cnt - 1].type)
+		cnt--;
+	btf_put(btf);
+	return min(cnt, U8_MAX);
+}
+
 /*
  * Sort instances by function and address, so instances of each
  * function are next to each other, and get rid of duplicates.
@@ -3108,6 +3216,7 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 		addrs[j] = addrs[i];
 		if (cookies)
 			cookies[j] = cookies[i];
+		lookup->args_cnt[j] = func_args_cnt(lookup->syms[i]);
 		j++;
 	}
 
@@ -3205,6 +3314,7 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	u32 flags, cnt, size;
 	void __user *uaddrs;
 	u64 *cookies = NULL;
+	u8 *args_cnt = NULL;
 	void __user *usyms;
 	bool strict;
 	int err;
@@ -3319,6 +3429,13 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 				.cookies  = cookies,
 			};
 
+			args_cnt = kvcalloc(cnt, sizeof(*args_cnt), GFP_KERNEL);
+			if (!args_cnt) {
+				err = -ENOMEM;
+				goto error;
+			}
+			lookup.args_cnt = args_cnt;
+
 			err = inline_lookup_symbols(&lookup);
 			/* The cnt is changed to number of functions with entry. */
 			if (!err)
@@ -3357,16 +3474,18 @@ int bpf_kprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 	link->addrs = addrs;
 	link->cookies = cookies;
+	link->args_cnt = args_cnt;
 	link->cnt = cnt;
 	link->link.flags = flags;
 	link->inlines = inlines;
 
-	if (cookies) {
+	if (cookies || args_cnt) {
 		/*
-		 * Sorting addresses will trigger sorting cookies as well
-		 * (check bpf_kprobe_multi_cookie_swap). This way we can
-		 * find cookie based on the address in bpf_get_attach_cookie
-		 * helper.
+		 * Sorting addresses will trigger sorting cookies and
+		 * args_cnt as well (check bpf_kprobe_multi_cookie_swap).
+		 * This way we can find cookie based on the address in
+		 * bpf_get_attach_cookie helper and number of arguments
+		 * in bpf_get_func_arg[_cnt] helpers.
 		 */
 		sort_r(addrs, cnt, sizeof(*addrs),
 		       bpf_kprobe_multi_cookie_cmp,
@@ -3409,6 +3528,7 @@ error:
 	kfree(link);
 	kvfree(addrs);
 	kvfree(cookies);
+	kvfree(args_cnt);
 	kvfree(inlines.sites);
 	return err;
 }
