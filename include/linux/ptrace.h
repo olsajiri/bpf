@@ -398,6 +398,16 @@ static inline void user_single_step_report(struct pt_regs *regs)
 #define exception_ip(x) instruction_pointer(x)
 #endif
 
+#ifndef regs_get_dwarf_register
+/* Get value of the register specified by DWARF register number. */
+static inline int regs_get_dwarf_register(struct pt_regs *regs,
+					  unsigned int regno,
+					  unsigned long *value)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 extern int task_current_syscall(struct task_struct *target, struct syscall_info *info);
 
 extern void sigaction_compat_abi(struct k_sigaction *act, struct k_sigaction *oact);

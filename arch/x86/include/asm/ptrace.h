@@ -317,6 +317,14 @@ static __always_inline bool regs_irqs_disabled(struct pt_regs *regs)
 /* Query offset/name of register from its name/offset */
 extern int regs_query_register_offset(const char *name);
 extern const char *regs_query_register_name(unsigned int offset);
+
+#ifdef CONFIG_X86_64
+/* Get value of the register specified by DWARF register number. */
+extern int regs_get_dwarf_register(struct pt_regs *regs, unsigned int regno,
+				   unsigned long *value);
+#define regs_get_dwarf_register regs_get_dwarf_register
+#endif
+
 #define MAX_REG_OFFSET (offsetof(struct pt_regs, ss))
 
 /**

@@ -147,6 +147,48 @@ const char *regs_query_register_name(unsigned int offset)
 	return NULL;
 }
 
+#ifdef CONFIG_X86_64
+/* DWARF register numbers as defined by x86-64 psABI. */
+static const unsigned int dwarf_regs[] = {
+	offsetof(struct pt_regs, ax),
+	offsetof(struct pt_regs, dx),
+	offsetof(struct pt_regs, cx),
+	offsetof(struct pt_regs, bx),
+	offsetof(struct pt_regs, si),
+	offsetof(struct pt_regs, di),
+	offsetof(struct pt_regs, bp),
+	offsetof(struct pt_regs, sp),
+	offsetof(struct pt_regs, r8),
+	offsetof(struct pt_regs, r9),
+	offsetof(struct pt_regs, r10),
+	offsetof(struct pt_regs, r11),
+	offsetof(struct pt_regs, r12),
+	offsetof(struct pt_regs, r13),
+	offsetof(struct pt_regs, r14),
+	offsetof(struct pt_regs, r15),
+	offsetof(struct pt_regs, ip),
+};
+
+/**
+ * regs_get_dwarf_register() - get register value from its DWARF number
+ * @regs:	pt_regs from which register value is gotten.
+ * @regno:	DWARF register number.
+ * @value:	the register value is stored here.
+ *
+ * regs_get_dwarf_register() stores value of the register specified by its
+ * DWARF register number @regno in @value and returns 0. If there's no
+ * value for the register in @regs, this returns -EOPNOTSUPP;
+ */
+int regs_get_dwarf_register(struct pt_regs *regs, unsigned int regno,
+			    unsigned long *value)
+{
+	if (regno >= ARRAY_SIZE(dwarf_regs))
+		return -EOPNOTSUPP;
+	*value = regs_get_register(regs, dwarf_regs[regno]);
+	return 0;
+}
+#endif
+
 /*
  * does not yet catch signals sent when the child dies.
  * in exit.c or in signal.c.
