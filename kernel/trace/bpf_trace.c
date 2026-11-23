@@ -1352,6 +1352,11 @@ static inline bool is_trace_fsession(const struct bpf_prog *prog)
 		prog->expected_attach_type == BPF_TRACE_FSESSION_MULTI);
 }
 
+#ifdef CONFIG_FPROBE
+static const struct bpf_func_proto bpf_get_func_arg_proto_kprobe_multi;
+static const struct bpf_func_proto bpf_get_func_arg_cnt_proto_kprobe_multi;
+#endif
+
 static const struct bpf_func_proto *
 kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
@@ -1378,6 +1383,12 @@ kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		if (is_uprobe_multi(prog))
 			return &bpf_get_attach_cookie_proto_umulti;
 		return &bpf_get_attach_cookie_proto_trace;
+#ifdef CONFIG_FPROBE
+	case BPF_FUNC_get_func_arg:
+		return is_kprobe_multi(prog) ? &bpf_get_func_arg_proto_kprobe_multi : NULL;
+	case BPF_FUNC_get_func_arg_cnt:
+		return is_kprobe_multi(prog) ? &bpf_get_func_arg_cnt_proto_kprobe_multi : NULL;
+#endif
 	default:
 		return bpf_tracing_func_proto(func_id, prog);
 	}
@@ -2362,12 +2373,20 @@ struct bpf_session_run_ctx {
 #ifdef CONFIG_FPROBE
 struct bpf_kprobe_multi_link;
 
+/*
+ * @loc_proto has locations of arguments of the inlined instance,
+ * it comes from inline @btf, which is either kernel (@vmlinux) or
+ * module one.
+ */
 struct inline_site {
 	struct kprobe kp;
 	struct bpf_kprobe_multi_link *link;
+	const struct btf *btf;
+	const struct btf_type *loc_proto;
 	u64 cookie;
 	u32 sym_idx;
 	bool has_entry;
+	bool vmlinux;
 };
 
 /*
@@ -2667,6 +2686,118 @@ int __weak bpf_arch_dwarf_regval(struct pt_regs *regs, u32 regno, u64 *value)
 	return -EOPNOTSUPP;
 }
 
+/*
+ * Get @n-th argument of the inlined instance @site from its location
+ * described in inline BTF, @regs are registers of the probed instruction.
+ */
+static int inline_site_arg(const struct inline_site *site, struct pt_regs *regs,
+			   u32 n, u64 *value)
+{
+	const struct btf_loc_param *p;
+	const struct btf_type *t;
+	u32 id, flags, vlen;
+	u64 val, mem = 0;
+	int err;
+
+	if (n >= btf_type_vlen(site->loc_proto))
+		return -EINVAL;
+
+	/* There's no location for the argument, it's likely optimized out. */
+	id = btf_loc_proto_params(site->loc_proto)[n];
+	if (!id)
+		return -ENOENT;
+
+	t = btf_type_by_id(site->btf, id);
+	p = btf_loc_param(t);
+	vlen = btf_type_vlen(t);
+	flags = p->flags;
+
+	/* The value needs to fit in u64. */
+	if (t->size > sizeof(u64))
+		return -EOPNOTSUPP;
+
+	if (flags & BTF_LOC_PARAM_CONST) {
+		val = p->values[0];
+		if (vlen > 1)
+			val |= (u64)p->values[1] << 32;
+		if (flags & BTF_LOC_PARAM_ADDR) {
+			/* The address is relative to the kernel image start. */
+			if (!site->vmlinux)
+				return -EOPNOTSUPP;
+			val += (unsigned long)_text;
+		} else if (flags & BTF_LOC_PARAM_SIGNED) {
+			val = sign_extend64(val, t->size * 8 - 1);
+		}
+		*value = val;
+		return 0;
+	}
+
+	/* Value stored in two registers. */
+	if (flags == BTF_LOC_PARAM_REG && vlen > 1)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Fails for registers we don't have value for, which includes
+	 * frame base register (BTF_LOC_PARAM_FBREG).
+	 */
+	err = bpf_arch_dwarf_regval(regs, p->values[0], &val);
+	if (err)
+		return err;
+
+	if (flags & BTF_LOC_PARAM_OFFSET) {
+		if (vlen > 2)
+			val += (u64)p->values[2] << 32 | p->values[1];
+		else
+			val += (s32)p->values[1];
+	}
+
+	if (flags & BTF_LOC_PARAM_DEREF) {
+		if (copy_from_kernel_nofault(&mem, (void *)(unsigned long)val, t->size))
+			return -EFAULT;
+		if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
+			mem >>= (sizeof(mem) - t->size) * 8;
+		val = mem;
+	}
+
+	*value = val;
+	return 0;
+}
+
+BPF_CALL_3(bpf_get_func_arg_kprobe_multi, struct pt_regs *, regs, u32, n, u64 *, value)
+{
+	struct bpf_kprobe_multi_run_ctx *run_ctx;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
+			       session_ctx.run_ctx);
+	if (!run_ctx->site)
+		return -EOPNOTSUPP;
+	return inline_site_arg(run_ctx->site, regs, n, value);
+}
+
+static const struct bpf_func_proto bpf_get_func_arg_proto_kprobe_multi = {
+	.func		= bpf_get_func_arg_kprobe_multi,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_WRITE | MEM_ALIGNED,
+	.arg3_size	= sizeof(u64),
+};
+
+BPF_CALL_1(bpf_get_func_arg_cnt_kprobe_multi, struct pt_regs *, regs)
+{
+	struct bpf_kprobe_multi_run_ctx *run_ctx;
+
+	run_ctx = container_of(current->bpf_ctx, struct bpf_kprobe_multi_run_ctx,
+			       session_ctx.run_ctx);
+	return run_ctx->site ? btf_type_vlen(run_ctx->site->loc_proto) : 0;
+}
+
+static const struct bpf_func_proto bpf_get_func_arg_cnt_proto_kprobe_multi = {
+	.func		= bpf_get_func_arg_cnt_kprobe_multi,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+};
+
 static __always_inline int
 kprobe_multi_link_prog_run(struct bpf_kprobe_multi_link *link,
 			   struct inline_site *site,
@@ -2917,7 +3048,9 @@ struct inline_lookup {
 	u32 cap;
 };
 
-static int inline_lookup_add(struct inline_lookup *lookup, unsigned long addr, u32 sym_idx)
+static int inline_lookup_add(struct inline_lookup *lookup, const struct btf *btf,
+			     const struct btf_loc *loc, unsigned long addr,
+			     u32 sym_idx, bool vmlinux)
 {
 	struct inline_site *sites;
 	u32 cap;
@@ -2936,7 +3069,10 @@ static int inline_lookup_add(struct inline_lookup *lookup, unsigned long addr, u
 
 	lookup->sites[lookup->cnt++] = (struct inline_site) {
 		.kp.addr = (kprobe_opcode_t *)addr,
+		.btf = btf,
+		.loc_proto = btf_type_by_id(btf, loc->loc_proto),
 		.sym_idx = sym_idx,
+		.vmlinux = vmlinux,
 	};
 	return 0;
 }
@@ -2946,7 +3082,8 @@ static int inline_lookup_add(struct inline_lookup *lookup, unsigned long addr, u
  * the offsets of its locations are relative to @base address.
  */
 static int inline_lookup_locsec(struct inline_lookup *lookup, const struct btf *btf,
-				const struct btf_type *locsec, unsigned long base)
+				const struct btf_type *locsec, unsigned long base,
+				bool vmlinux)
 {
 	struct btf_loc *loc;
 	int idx, err;
@@ -2956,7 +3093,7 @@ static int inline_lookup_locsec(struct inline_lookup *lookup, const struct btf *
 		idx = inline_sym_idx(btf, loc, lookup->syms, lookup->syms_cnt);
 		if (idx < 0)
 			continue;
-		err = inline_lookup_add(lookup, base + loc->offset, idx);
+		err = inline_lookup_add(lookup, btf, loc, base + loc->offset, idx, vmlinux);
 		if (err)
 			return err;
 	}
@@ -2989,7 +3126,7 @@ static int inline_lookup_module(struct module *mod, const struct btf *btf, void 
 		base = module_sect_addr(mod, name + strlen("inline"));
 		if (!base || !within_module_mem_type(base, mod, MOD_TEXT))
 			continue;
-		err = inline_lookup_locsec(lookup, btf, t, base);
+		err = inline_lookup_locsec(lookup, btf, t, base, false);
 		if (err)
 			return err;
 	}
@@ -3073,7 +3210,8 @@ static int inline_lookup_symbols(struct inline_lookup *lookup)
 	if (err)
 		goto error;
 
-	err = inline_lookup_locsec(lookup, btf, btf_type_by_id(btf, id), (unsigned long)_stext);
+	err = inline_lookup_locsec(lookup, btf, btf_type_by_id(btf, id),
+				   (unsigned long)_stext, true);
 	if (err)
 		goto error;
 
